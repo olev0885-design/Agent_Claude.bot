@@ -30,8 +30,9 @@ from dotenv import load_dotenv
 
 # Наш класс сборки команды агентов из crew.py и инструмент сделок.
 from bot_crew.crew import BotCrew
-from bot_crew.tools.trade_tool import TradeExecutionTool
+from bot_crew import trade_executor
 from bot_crew import position_store
+from bot_crew import blocked_coins_store
 from bot_crew.notifier import TelegramNotifier
 
 
@@ -66,60 +67,34 @@ def extract_coin_from_signal(text: str):
 
 
 # =============================================================================
-# Форматирование комиссий (taker) в отчётах — реальная ставка берётся с
-# биржи через trade_tool._get_taker_fee_rate (см. там подробный комментарий,
-# почему именно taker, а не maker/усреднённые цифры "из интернета").
-# =============================================================================
-def _format_fee(leg: dict) -> str:
-    rate = leg.get("taker_fee_rate")
-    fee = leg.get("fee_usdt")
-    if rate is None:
-        return "ставка неизвестна (не удалось получить с биржи)"
-    fee_str = f"{fee:.4f} USDT" if fee is not None else "сумма неизвестна"
-    return f"taker {rate * 100:.3f}% ({fee_str})"
-
-
-def _sum_fees(*legs: dict):
-    """Суммирует fee_usdt по нескольким ногам; None, если хотя бы для
-    одной ноги комиссию не удалось узнать (лучше явно показать "неизвестно",
-    чем тихо занизить сумму, пропустив неизвестное слагаемое)."""
-    return _sum_fees_values(*(leg.get("fee_usdt") for leg in legs))
-
-
-def _sum_fees_values(*fees):
-    """То же самое, но принимает уже готовые числа (например, значения,
-    сохранённые в position_store при открытии), а не словари ног."""
-    fees = list(fees)
-    if any(f is None for f in fees):
-        return None
-    return sum(fees)
-
-
-# =============================================================================
-# OPEN — открытие позиции по Spread-сигналу
-# =============================================================================
-# ВАЖНО: парсинг текста делает LLM (BotCrew.parse_signal — единственная
-# задача, где реально нужна языковая модель: вытащить структурные поля из
-# полу-хаотичного текста). САМО ОТКРЫТИЕ СДЕЛКИ идёт напрямую через
-# TradeExecutionTool.open_spread() — обычным Python-вызовом, БЕЗ
-# LLM-агента trade_executor. Так надёжнее: цену входа, объём и order_id
-# для реальных денег лучше брать из фактического ответа CCXT, а не из
-# текста, сгенерированного языковой моделью.
+# OPEN/CLOSE — тонкие обёртки поверх trade_executor.py (детерминированная
+# логика открытия/закрытия по структурным coin/long_exchange/short_exchange,
+# без LLM — см. подробный комментарий в самом trade_executor.py). Здесь,
+# в main.py, добавляется ТОЛЬКО то, что специфично именно для Telegram-
+# сигналов канала: парсинг сырого текста через LLM (open_signal) и разбор
+# формата "aligned in" (close_signal). scanner.py вызывает
+# trade_executor.open_structured_signal()/close_structured_signal() НАПРЯМУЮ,
+# минуя эти обёртки — у него уже готовые структурные данные, LLM не нужен.
 # =============================================================================
 def open_signal(raw_text: str, notifier: "TelegramNotifier | None" = None) -> str:
-    """Парсит OPEN-сигнал, открывает обе ноги и ставит позицию на учёт
-    (position_store) для последующего закрытия. Возвращает текстовый отчёт.
+    """Парсит OPEN-сигнал канала через LLM (BotCrew.parse_signal — единственное
+    место, где он реально нужен: вытащить структурные поля из полу-хаотичного
+    текста) и делегирует открытие сделки в trade_executor.
 
-    notifier (опционально) — если передан, СРАЗУ после того, как ордера
-    реально отправлены на биржи (result уже получен от tool.open_spread),
-    шлёт мгновенное Telegram-уведомление — ДО дальнейшей обработки (расчёт
-    суммарной комиссии, запись в position_store), которая теоретически
-    может упасть с ошибкой уже ПОСЛЕ того, как сделка реально совершена."""
+    ГЕЙТЫ ВХОДА (добавлены 2026-09-06 по явной просьбе пользователя — "те же
+    правила, что и у сканера"): сигналы канала раньше открывали сделку БЕЗ
+    какой-либо проверки — ни порога спреда, ни лимита "не более 1 позиции
+    одновременно", ни списка исключённых монет (SCANNER_EXCLUDED_COINS), в
+    отличие от сканера (scanner.py:_handle_test_batch_opportunity). Теперь
+    сигнал канала проходит ТЕ ЖЕ три проверки, что и находки сканера, ПЕРЕД
+    тем как уйти в trade_executor — единообразно, независимо от источника
+    связки."""
     parsed = BotCrew().parse_signal(raw_text)
 
     coin = parsed.get("coin")
     long_exchange = parsed.get("long_exchange")
     short_exchange = parsed.get("short_exchange")
+    spread_percent = parsed.get("spread_percent")
 
     if not coin or not long_exchange or not short_exchange:
         return (
@@ -127,246 +102,74 @@ def open_signal(raw_text: str, notifier: "TelegramNotifier | None" = None) -> st
             f"(распарсено: {parsed}) — сделка не открывается."
         )
 
-    tool = TradeExecutionTool()
-    result = tool.open_spread(coin, long_exchange, short_exchange)
+    excluded_coins = {
+        name.strip().upper()
+        for name in os.getenv("SCANNER_EXCLUDED_COINS", "").split(",")
+        if name.strip()
+    }
+    if coin.upper() in excluded_coins:
+        return f"Монета #{coin} в списке исключённых (SCANNER_EXCLUDED_COINS) — сигнал пропущен."
 
-    if result["cancelled"]:
-        if notifier:
-            notifier.notify_error(
-                symbol=result["coin"],
-                error_message=f"Сделка не открыта ни на одной ноге: {result['reason']}",
+    # Точечное исключение "монета+биржа" (см. blocked_coins_store.py) — по
+    # прямой просьбе пользователя 2026-09-09: монета торгуется нормально
+    # везде, кроме конкретной биржи (напр. DELTA на MEXC).
+    for bad_exchange in (long_exchange, short_exchange):
+        if blocked_coins_store.is_coin_exchange_excluded(coin, bad_exchange):
+            return (
+                f"Сигнал #{coin}: монета исключена именно для биржи {bad_exchange} "
+                f"(SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS) — сигнал пропущен."
             )
-        return f"Монета: {result['coin']}\nСделка НЕ открыта: {result['reason']}"
 
-    long_leg, short_leg = result["long"], result["short"]
-    ok_statuses = ("OK", "DRY_RUN_OK")
-    both_ok = long_leg["status"] in ok_statuses and short_leg["status"] in ok_statuses
-
-    # --- Мгновенное уведомление — сразу после исполнения ордеров -----------
-    if notifier:
-        try:
-            if both_ok:
-                notifier.notify_open(
-                    symbol=result["coin"],
-                    long_exchange=long_exchange,
-                    long_price=long_leg.get("price"),
-                    short_exchange=short_exchange,
-                    short_price=short_leg.get("price"),
-                    spread=parsed.get("spread_percent"),
-                )
-            else:
-                notifier.notify_error(
-                    symbol=result["coin"],
-                    error_message=(
-                        f"LONG {long_exchange}: {long_leg['status']}; "
-                        f"SHORT {short_exchange}: {short_leg['status']} — "
-                        f"не все ноги открылись, позиция НЕ поставлена на "
-                        f"автозакрытие, требуется ручная проверка!"
-                    ),
-                )
-        except Exception as exc:
-            # Сбой самого уведомления НЕ должен мешать сформировать
-            # текстовый отчёт ниже — торговая логика уже отработала.
-            print(f"[notifier] сбой при формировании уведомления об открытии: {exc}")
-
-    report_lines = [
-        f"Монета: {result['coin']}",
-        f"LONG на {long_exchange}: {long_leg['status']} "
-        f"(order_id={long_leg['order_id']}, цена={long_leg['price']}, "
-        f"комиссия за вход: {_format_fee(long_leg)})",
-        f"SHORT на {short_exchange}: {short_leg['status']} "
-        f"(order_id={short_leg['order_id']}, цена={short_leg['price']}, "
-        f"комиссия за вход: {_format_fee(short_leg)})",
-        f"Задержка между ногами: {result['elapsed_ms']} мс",
-    ]
-
-    entry_fee_total = _sum_fees(long_leg, short_leg)
-    if entry_fee_total is not None:
-        invested = (long_leg.get("amount_usdt") or 0) * 2
-        pct = (entry_fee_total / invested * 100) if invested else None
-        report_lines.append(
-            f"Суммарная комиссия за вход: {entry_fee_total:.4f} USDT"
-            + (f" ({pct:.2f}% от {invested:.2f} USDT вложенных)" if pct is not None else "")
-        )
-
-    if both_ok:
-        # Записываем позицию на учёт — по ней должен прийти "aligned in"
-        # с тем же тикером, и тогда close_signal() найдёт её здесь.
-        position_store.record_open(
-            result["coin"],
-            {
-                "coin": result["coin"],
-                "long_exchange": long_exchange,
-                "short_exchange": short_exchange,
-                "long_amount_coin": long_leg.get("amount_coin"),
-                "short_amount_coin": short_leg.get("amount_coin"),
-                "long_entry_price": long_leg.get("price"),
-                "short_entry_price": short_leg.get("price"),
-                "amount_usdt": long_leg.get("amount_usdt"),
-                "leverage": result.get("leverage"),
-                "long_order_id": long_leg.get("order_id"),
-                "short_order_id": short_leg.get("order_id"),
-                "long_entry_fee_usdt": long_leg.get("fee_usdt"),
-                "short_entry_fee_usdt": short_leg.get("fee_usdt"),
-                "long_taker_fee_rate": long_leg.get("taker_fee_rate"),
-                "short_taker_fee_rate": short_leg.get("taker_fee_rate"),
-            },
-        )
-        report_lines.append(
-            '✅ Позиция поставлена на учёт — будет закрыта по сигналу '
-            '"aligned in" из канала.'
-        )
-    else:
-        # Одна из ног не открылась (несмотря на pre-check в trade_tool) —
-        # например, ERROR уже на боевом ордере (недостаточно средств и
-        # т.п.). НЕ ставим на автозакрытие: если открылась ровно одна
-        # нога, это реальная незахеджированная позиция, требующая
-        # ручного вмешательства, а не тихого автоматического учёта.
-        report_lines.append(
-            "⚠️ ВНИМАНИЕ: не все ноги открылись успешно — позиция НЕ "
-            "поставлена на автоматическое закрытие. Проверьте вручную "
-            "на биржах!"
-        )
-
-    return "\n".join(report_lines)
-
-
-# =============================================================================
-# CLOSE — закрытие позиции по сигналу "aligned in"
-# =============================================================================
-# Здесь СОЗНАТЕЛЬНО нет никакого LLM — детерминированная логика (найти
-# позицию по тикеру, закрыть обе ноги, посчитать PnL арифметикой) не
-# должна зависеть от вероятностной генерации текста, особенно когда на
-# кону реальные деньги и точный расчёт прибыли/убытка.
-# =============================================================================
-def close_signal(coin: str, notifier: "TelegramNotifier | None" = None) -> str:
-    """Закрывает позицию по монете, если она есть в учёте. Возвращает
-    текстовый отчёт с PnL, либо None, если по этой монете позиции нет
-    (значит, сигнал не про нашу сделку — не обрабатываем).
-
-    notifier — см. open_signal(): шлёт мгновенный алерт сразу после
-    закрытия ордеров, до финального форматирования текстового отчёта."""
-    position = position_store.get_position(coin)
-    if not position:
-        return None
-
-    if position.get("long_amount_coin") is None or position.get("short_amount_coin") is None:
-        # Позиция была открыта в DRY_RUN без реального объёма в монете —
-        # физически закрывать нечего, просто снимаем с учёта.
-        position_store.pop_position(coin)
+    if blocked_coins_store.is_blocked(coin):
+        info = blocked_coins_store.get_block_info(coin) or {}
         return (
-            f"Монета: {coin}\n"
-            f"Получен сигнал закрытия, но позиция была открыта в DRY_RUN "
-            f"(нет реального объёма в монете) — снята с учёта без реального "
-            f"закрытия ордеров."
+            f"Монета #{coin} АВТОМАТИЧЕСКИ ЗАБЛОКИРОВАНА после повторных реальных откатов "
+            f"(последняя причина: {(info.get('reasons') or ['?'])[-1]}) — сигнал пропущен до ручной разблокировки."
         )
 
-    tool = TradeExecutionTool()
-    close_result = tool.close_spread(
-        coin,
-        position["long_exchange"],
-        position["short_exchange"],
-        position["long_amount_coin"],
-        position["short_amount_coin"],
+    min_spread = float(os.getenv("TEST_BATCH_MIN_SPREAD", os.getenv("AUTO_TRADE_MIN_SPREAD", "3.0")))
+    if spread_percent is not None and spread_percent < min_spread:
+        return (
+            f"Сигнал #{coin}: спред {spread_percent}% ниже порога входа "
+            f"{min_spread}% — сделка не открывается."
+        )
+
+    # НЕ БОЛЕЕ 1 ОТКРЫТОЙ НОГИ НА БИРЖУ ОДНОВРЕМЕННО (по явной просьбе
+    # пользователя 2026-09-07 — та же проверка, что и в scanner.py:
+    # _handle_test_batch_opportunity, см. комментарий в position_store.
+    # busy_exchanges() — снижает риск каскада под cross margin).
+    busy = position_store.busy_exchanges()
+    if long_exchange.lower() in busy or short_exchange.lower() in busy:
+        return (
+            f"Сигнал #{coin}: на бирже {long_exchange if long_exchange.lower() in busy else short_exchange} "
+            f"уже есть открытая нога другой позиции (лимит — 1 нога на биржу) — сигнал пропущен."
+        )
+
+    # ИСКЛЮЧЕНИЕ (по явной просьбе пользователя 2026-09-06): разрешён РОВНО
+    # ОДИН сигнал канала сверх обычного лимита сканера "не более 1 позиции
+    # одновременно" — т.е. сигнал канала пропускается, только если открытых
+    # позиций УЖЕ 2 или больше (а не 1, как для находок самого сканера).
+    if len(position_store.list_positions()) >= 2:
+        return (
+            f"Сигнал #{coin}: уже есть 2 открытые позиции (обычный лимит "
+            f"сканера — 1, для сигналов канала сделано разовое исключение "
+            f"ещё на 1) — сигнал пропущен."
+        )
+
+    return trade_executor.open_structured_signal(
+        coin, long_exchange, short_exchange,
+        spread_percent=spread_percent,
+        notifier=notifier,
     )
 
-    long_leg, short_leg = close_result["long"], close_result["short"]
-    ok_statuses = ("OK", "DRY_RUN_OK")
-    both_ok = long_leg["status"] in ok_statuses and short_leg["status"] in ok_statuses
 
-    # Снимаем с учёта ТОЛЬКО если обе ноги закрылись — если что-то пошло
-    # не так, позиция остаётся в учёте (лучше "зависшая" запись, которую
-    # видно, чем незаметно потерянный риск на реальные деньги).
-    if both_ok:
-        position_store.pop_position(coin)
-
-    pnl_line = "PnL (до комиссий): недоступен (нет реальных цен входа/выхода — DRY_RUN или ошибка ноги)"
-    net_pnl_line = None
-    # Инициализация на случай, если ветка ниже не выполнится (нет цен) —
-    # чтобы блок уведомления после неё мог безопасно на них сослаться.
-    total_pnl = pnl_pct = net_pnl = net_pnl_pct = None
-    if (
-        long_leg.get("price") and short_leg.get("price")
-        and position.get("long_entry_price") and position.get("short_entry_price")
-    ):
-        # LONG зарабатывает, когда цена ВЫРОСЛА; SHORT — когда УПАЛА.
-        long_pnl = (long_leg["price"] - position["long_entry_price"]) * position["long_amount_coin"]
-        short_pnl = (position["short_entry_price"] - short_leg["price"]) * position["short_amount_coin"]
-        total_pnl = long_pnl + short_pnl
-        invested = position["amount_usdt"] * 2  # обе ноги по amount_usdt
-        pnl_pct = (total_pnl / invested * 100) if invested else None
-        pnl_line = (
-            f"PnL (до комиссий): {total_pnl:+.4f} USDT"
-            + (f" ({pnl_pct:+.2f}% от {invested:.2f} USDT вложенных)" if pnl_pct is not None else "")
-        )
-
-        # Комиссии за весь круг (вход + выход, обе ноги, taker) — вход
-        # берём из того, что записали при открытии, выход — из результата
-        # закрытия только что.
-        entry_fee_total = _sum_fees_values(
-            position.get("long_entry_fee_usdt"), position.get("short_entry_fee_usdt")
-        )
-        exit_fee_total = _sum_fees(long_leg, short_leg)
-        if entry_fee_total is not None and exit_fee_total is not None:
-            round_trip_fee = entry_fee_total + exit_fee_total
-            net_pnl = total_pnl - round_trip_fee
-            net_pnl_pct = (net_pnl / invested * 100) if invested else None
-            net_pnl_line = (
-                f"Комиссии за весь круг (вход+выход): {round_trip_fee:.4f} USDT\n"
-                f"PnL (после комиссий): {net_pnl:+.4f} USDT"
-                + (f" ({net_pnl_pct:+.2f}% от {invested:.2f} USDT вложенных)" if net_pnl_pct is not None else "")
-            )
-
-    # --- Мгновенное уведомление — сразу после исполнения ордеров закрытия --
-    if notifier:
-        try:
-            if both_ok:
-                # Предпочитаем PnL "после комиссий" (net) как более честный
-                # "итоговый" результат; если комиссии не удалось узнать —
-                # используем PnL "до комиссий" (gross) как запасной вариант.
-                final_pnl = net_pnl if net_pnl is not None else total_pnl
-                final_pnl_pct = net_pnl_pct if net_pnl_pct is not None else pnl_pct
-                notifier.notify_close(
-                    symbol=coin,
-                    reason="спред сошёлся (сигнал \"aligned in\" из канала)",
-                    pnl_amount=final_pnl,
-                    pnl_percent=final_pnl_pct,
-                )
-            else:
-                notifier.notify_error(
-                    symbol=coin,
-                    error_message=(
-                        f"LONG {position['long_exchange']}: {long_leg['status']}; "
-                        f"SHORT {position['short_exchange']}: {short_leg['status']} — "
-                        f"не все ноги закрылись, позиция ОСТАЛАСЬ в учёте, "
-                        f"требуется ручная проверка!"
-                    ),
-                )
-        except Exception as exc:
-            print(f"[notifier] сбой при формировании уведомления о закрытии: {exc}")
-
-    report_lines = [
-        f"Монета: {coin}",
-        f"Вход:  LONG {position['long_exchange']}@{position.get('long_entry_price')}, "
-        f"SHORT {position['short_exchange']}@{position.get('short_entry_price')}",
-        f"Выход: LONG {position['long_exchange']}: {long_leg['status']} "
-        f"(order_id={long_leg['order_id']}, цена={long_leg['price']}, "
-        f"комиссия за выход: {_format_fee(long_leg)})",
-        f"       SHORT {position['short_exchange']}: {short_leg['status']} "
-        f"(order_id={short_leg['order_id']}, цена={short_leg['price']}, "
-        f"комиссия за выход: {_format_fee(short_leg)})",
-        pnl_line,
-    ]
-    if net_pnl_line:
-        report_lines.append(net_pnl_line)
-    report_lines.append(f"Задержка между ногами закрытия: {close_result['elapsed_ms']} мс")
-    if not both_ok:
-        report_lines.append(
-            "⚠️ ВНИМАНИЕ: не обе ноги закрылись — проверьте позицию "
-            "вручную на биржах!"
-        )
-
-    return "\n".join(report_lines)
+def close_signal(coin: str, notifier: "TelegramNotifier | None" = None) -> str:
+    """Закрывает позицию по сигналу "aligned in" из канала — тонкая обёртка
+    над trade_executor.close_structured_signal() с соответствующей причиной
+    закрытия для отчёта/уведомления."""
+    return trade_executor.close_structured_signal(
+        coin, notifier=notifier, reason='сигнал "aligned in" из канала'
+    )
 
 
 # =============================================================================
@@ -462,14 +265,102 @@ def listen() -> None:
     # отправку из чужого потока через run_coroutine_threadsafe.
     notifier = TelegramNotifier(client, client.loop)
 
+    # См. подробный комментарий у _bot_event_loop в trade_tool.py — по
+    # просьбе пользователя 2026-09-08 ("уменьшить задержку на мониторинг,
+    # проверку цены и вход"): сообщаем trade_tool.py ЭТОТ ЖЕ (Telethon/
+    # scanner) постоянный event loop, чтобы реальное исполнение сделок
+    # планировалось на него (run_coroutine_threadsafe, тот же механизм,
+    # что и у notifier выше) и переиспользовало живые соединения с
+    # биржами между сделками — вместо одноразового loop на КАЖДЫЙ
+    # ордер/проверку/закрытие. При TRADE_USE_PERSISTENT_CONNECTIONS=False
+    # (мгновенный откат без правки кода) эта настройка просто игнорируется.
+    from bot_crew.tools import trade_tool
+    trade_tool.set_bot_event_loop(client.loop)
+
     dry_run = os.getenv("DRY_RUN", "True").lower() == "true"
+    demo_trading = os.getenv("DEMO_TRADING", "False").lower() == "true"
     print("=" * 70)
     print(f"ЗАПУСК ЖИВОГО ПРОСЛУШИВАНИЯ КАНАЛА {channel_id}")
     print(f"DRY_RUN={dry_run} " + ("(симуляция, реальные ордера НЕ отправляются)"
-                                    if dry_run else "(БОЕВОЙ РЕЖИМ — реальные деньги!)"))
+                                    if dry_run else "(ордера реально отправляются на биржи)"))
+    if not dry_run:
+        # DEMO_TRADING сам по себе не защищает биржи вне
+        # DEMO_TRADING_SUPPORTED (mexc, aster) — они по умолчанию просто
+        # пропускаются целиком, КРОМЕ явно разрешённых через
+        # DEMO_ALLOW_LIVE_EXCHANGES (см. trade_tool.py _is_exchange_configured)
+        # — те торгуют РЕАЛЬНЫМИ деньгами даже во время demo. Баннер ниже
+        # явно называет их, чтобы это не терялось в логах.
+        live_allowed = sorted(
+            n.strip() for n in os.getenv("DEMO_ALLOW_LIVE_EXCHANGES", "").split(",") if n.strip()
+        )
+        print(
+            "DEMO_TRADING=" + str(demo_trading)
+            + (
+                " (bybit/bitget/gate — виртуальные деньги; остальные сигналы"
+                " пропускаются целиком"
+                + (
+                    f", КРОМЕ {', '.join(live_allowed)} — торгует(ют) РЕАЛЬНЫМИ деньгами!)"
+                    if live_allowed
+                    else ")"
+                )
+                if demo_trading
+                else " (⚠️ БОЕВОЙ РЕЖИМ НА ВСЕХ БИРЖАХ — реальные деньги!)"
+            )
+        )
     print("=" * 70)
 
-    @client.on(events.NewMessage(chats=channel_id))
+    # =========================================================================
+    # СКАНЕР РЫНКА (scanner.py) — опционально, SCANNER_ENABLED=True в .env.
+    # Ищет спреды/фандинг САМ через CCXT, не дожидаясь сигналов канала, и
+    # шлёт вам Telegram-алерты (+ авто-торговля, если ещё и AUTO_TRADE=True).
+    # Запускается КАК ФОНОВАЯ ЗАДАЧА в ТОМ ЖЕ event loop, что и Telegram-
+    # клиент (client.loop.create_task(...)) — не отдельный процесс/поток, а
+    # ещё одна корутина, выполняющаяся параллельно с обработкой сообщений
+    # канала. Планируем задачу СЕЙЧАС, а не await — сама она начнёт
+    # выполняться, когда цикл действительно закрутится внутри
+    # client.run_until_disconnected() ниже.
+    # =========================================================================
+    scanner_enabled = os.getenv("SCANNER_ENABLED", "False").lower() == "true"
+    if scanner_enabled:
+        from bot_crew.scanner import FundingScanner
+
+        scanner = FundingScanner(notifier)
+        client.loop.create_task(scanner.run())
+        print(f"[scanner] Включён (SCANNER_ENABLED=True). AUTO_TRADE_ENABLED={scanner.auto_trade.enabled}")
+    else:
+        print("[scanner] Выключен (SCANNER_ENABLED=False в .env).")
+    print("=" * 70)
+
+    # ПРОСЛУШИВАНИЕ КАНАЛА СИГНАЛОВ — отключаемо ОТДЕЛЬНО от самого
+    # Telegram-клиента (по явной просьбе пользователя 2026-09-06:
+    # "отключись от телеграм канала", оставив сканер и уведомления
+    # рабочими). CHANNEL_SIGNALS_ENABLED=False просто не регистрирует
+    # обработчик новых сообщений канала — сам client (и, значит,
+    # notifier/сканер) продолжает работать как обычно.
+    channel_signals_enabled = os.getenv("CHANNEL_SIGNALS_ENABLED", "True").lower() == "true"
+    if not channel_signals_enabled:
+        print(f"[channel] Прослушивание канала {channel_id} ОТКЛЮЧЕНО (CHANNEL_SIGNALS_ENABLED=False).")
+    print("=" * 70)
+
+    # ВТОРОЙ ИСТОЧНИК СИГНАЛОВ — канал внешнего сервиса SkySpreads.net (по
+    # прямой просьбе пользователя 2026-09-09). Формат сообщений полностью
+    # другой (см. skyspreads_signals.py) — отдельный классификатор/парсер
+    # БЕЗ LLM (формат стабильный), отдельный event-handler на СВОЙ channel
+    # ID, те же гейты входа (excluded_coins/автоблокировка/лимит ноги на
+    # биржу/лимит позиций/порог спреда) + доп.проверка "обе биржи сигнала
+    # реально поддерживаются ботом" (SkySpreads мониторит 18+ бирж, мы
+    # торгуем на 6 — большинство сигналов оттуда не наши, это норма).
+    skyspreads_enabled = os.getenv("SKYSPREADS_SIGNALS_ENABLED", "False").lower() == "true"
+    skyspreads_channel_id_raw = os.getenv("SKYSPREADS_CHANNEL_ID")
+    if skyspreads_enabled and not skyspreads_channel_id_raw:
+        print("[skyspreads] SKYSPREADS_SIGNALS_ENABLED=True, но SKYSPREADS_CHANNEL_ID не задан — прослушивание НЕ запущено.")
+        skyspreads_enabled = False
+    if skyspreads_enabled:
+        print(f"[skyspreads] Прослушивание канала SkySpreads {skyspreads_channel_id_raw} ВКЛЮЧЕНО.")
+    else:
+        print("[skyspreads] Прослушивание канала SkySpreads ОТКЛЮЧЕНО (SKYSPREADS_SIGNALS_ENABLED=False).")
+    print("=" * 70)
+
     async def handler(event):
         text = event.raw_text or ""
         signal_type = classify_signal(text)
@@ -526,7 +417,119 @@ def listen() -> None:
         except Exception as exc:
             print(f"Не удалось отправить отчёт в Telegram: {exc}")
 
+    # Регистрируем обработчик ТОЛЬКО если прослушивание канала включено —
+    # см. CHANNEL_SIGNALS_ENABLED выше. Client.on(...) как декоратор всегда
+    # регистрирует безусловно, поэтому здесь — явный add_event_handler
+    # внутри if, а не декоратор над функцией handler.
+    if channel_signals_enabled:
+        client.add_event_handler(handler, events.NewMessage(chats=channel_id))
+
+    # ВАЖНО: канал SkySpreads состоит из аккаунта ВТОРОГО номера пользователя
+    # (SKYSPREADS_TELEGRAM_PHONE, не TELEGRAM_PHONE основного рабочего
+    # аккаунта бота) — по прямой просьбе пользователя 2026-09-09, у него
+    # нет возможности добавить рабочий аккаунт бота в этот чат напрямую.
+    # Поэтому слушаем этот канал ВТОРЫМ, отдельным TelegramClient (своя
+    # сессия skyspreads_session.session, вход выполнен один раз заранее),
+    # но на ТОМ ЖЕ event loop, что и основной client (loop=client.loop) —
+    # критично для scanner.py/trade_tool.py, которые уже привязаны к этому
+    # конкретному loop (см. set_bot_event_loop выше). Отчёты всё равно
+    # шлём через ОСНОВНОЙ client в "me" — единая точка уведомлений,
+    # независимо от того, каким аккаунтом сигнал был прочитан.
+    skyspreads_client = None
+    if skyspreads_enabled:
+        from bot_crew import skyspreads_signals
+
+        skyspreads_channel_id = int(skyspreads_channel_id_raw)
+        skyspreads_session = os.getenv("SKYSPREADS_TELEGRAM_SESSION", "skyspreads_session")
+
+        skyspreads_client = TelegramClient(
+            skyspreads_session,
+            int(os.getenv("TELEGRAM_API_ID")),
+            os.getenv("TELEGRAM_API_HASH"),
+            loop=client.loop,
+        )
+
+        async def skyspreads_handler(event):
+            text = event.raw_text or ""
+            if skyspreads_signals.classify_skyspreads_signal(text) != "OPEN":
+                return
+            print(f"\n[SkySpreads OPEN-сигнал получен] {text[:60]}...")
+            loop = asyncio.get_running_loop()
+            try:
+                report = await loop.run_in_executor(
+                    None, skyspreads_signals.open_skyspreads_signal, text, notifier
+                )
+            except Exception as exc:
+                print(f"[КРИТИЧЕСКАЯ ОШИБКА обработки SkySpreads-сигнала] {exc}")
+                notifier.notify_error(
+                    symbol="?",
+                    error_message=f"Необработанное исключение при обработке SkySpreads-сигнала: {exc}",
+                )
+                return
+            if report is None:
+                # Сигнал не наш (неподдерживаемая биржа/мусорный спред) —
+                # намеренно НЕ шлём уведомление, см. skyspreads_signals.py.
+                return
+            print("-" * 70)
+            print(report)
+            print("-" * 70)
+            try:
+                await client.send_message("me", report)
+            except Exception as exc:
+                print(f"Не удалось отправить отчёт в Telegram: {exc}")
+
+        skyspreads_client.add_event_handler(skyspreads_handler, events.NewMessage(chats=skyspreads_channel_id))
+
     client.start(os.getenv("TELEGRAM_PHONE"))
+
+    if skyspreads_client is not None:
+        # Сессия уже авторизована (вход выполнен заранее отдельным
+        # скриптом) — start() без телефона просто подключается, не
+        # запрашивая код повторно.
+        skyspreads_client.start()
+        print(f"[skyspreads] Второй аккаунт подключён и слушает канал {skyspreads_channel_id_raw}.")
+
+    # =========================================================================
+    # УВЕДОМЛЕНИЕ О ПРАВКАХ/РЕСТАРТЕ В @Depositik — по явной просьбе
+    # пользователя 2026-09-07: "как будешь вносить какие-то правки или
+    # что-то подобное, то сообщай в телеграмме @Depositik". Правки в код/
+    # .env применяются только после перезапуска бота (см. комментарии в
+    # config.py/scanner.py про "читается один раз при старте"), поэтому
+    # каждый рестарт — естественная точка для отчёта. Заметку ПЕРЕД
+    # рестартом кладут в restart_note.txt (в корне проекта, рядом с
+    # open_positions.json) — читаем и сразу удаляем файл, чтобы не
+    # продублировать её при следующем обычном рестарте без новой заметки.
+    #
+    # notifier здесь намеренно НЕ используется (его _dispatch планирует
+    # отправку через run_coroutine_threadsafe в УЖЕ КРУТЯЩИЙСЯ event loop
+    # — client.loop входит в этот режим только внутри run_until_disconnected
+    # ниже) — вместо этого отправляем СИНХРОННО через run_until_complete,
+    # как и сам client.start() парой строк выше.
+    # =========================================================================
+    _restart_note_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "restart_note.txt",
+    )
+    _restart_note = ""
+    if os.path.exists(_restart_note_path):
+        try:
+            with open(_restart_note_path, "r", encoding="utf-8") as _f:
+                _restart_note = _f.read().strip()
+            os.remove(_restart_note_path)
+        except OSError as exc:
+            print(f"[startup] Не удалось прочитать/удалить restart_note.txt: {exc}")
+    _restart_text = "🔄 Бот перезапущен" + (f"\n\n{_restart_note}" if _restart_note else "")
+    try:
+        client.loop.run_until_complete(
+            asyncio.gather(
+                client.send_message("me", _restart_text),
+                client.send_message("@Depositik", _restart_text),
+                return_exceptions=True,
+            )
+        )
+    except Exception as exc:
+        print(f"[startup] Не удалось отправить уведомление о рестарте: {exc}")
+
     client.run_until_disconnected()
 
 

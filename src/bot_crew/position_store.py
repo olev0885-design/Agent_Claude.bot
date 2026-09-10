@@ -72,3 +72,25 @@ def pop_position(coin: str) -> Optional[dict]:
 def list_positions() -> dict:
     """Все текущие открытые позиции — полезно для отчёта/отладки."""
     return _load()
+
+
+def busy_exchanges() -> set:
+    """Множество бирж (имена в нижнем регистре), на которых ПРЯМО СЕЙЧАС
+    есть открытая нога хотя бы одной позиции — по явной просьбе
+    пользователя 2026-09-07: "не больше 1 открытого ордера на бирже,
+    допустим на mexc и gate открыты по ноге — не открываем новую ногу
+    пока эта не закроется, но можно открывать на других биржах". Снижает
+    риск каскада — одна плохая сделка на бирже не делит margin-пул с
+    другой открытой позицией на ТОЙ ЖЕ бирже под cross margin (реальный
+    инцидент 2026-09-06: BONER утащил за собой здоровый BP на Gate).
+    Используется ОБОИМИ путями входа (сканер и сигналы канала) как единый
+    источник правды — см. вызовы в scanner.py/main.py."""
+    exchanges: set = set()
+    for position in list_positions().values():
+        long_ex = position.get("long_exchange")
+        short_ex = position.get("short_exchange")
+        if long_ex:
+            exchanges.add(long_ex.lower())
+        if short_ex:
+            exchanges.add(short_ex.lower())
+    return exchanges
