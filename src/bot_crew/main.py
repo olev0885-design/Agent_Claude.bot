@@ -524,6 +524,10 @@ def listen() -> None:
             asyncio.gather(
                 client.send_message("me", _restart_text),
                 client.send_message("@Depositik", _restart_text),
+                # @G_Pobedonosec добавлен 2026-09-12 по прямой просьбе
+                # пользователя — оба аккаунта должны видеть рестарты/правки
+                # в боте, наравне с входом/выходом и дневным отчётом.
+                client.send_message("@G_Pobedonosec", _restart_text),
                 return_exceptions=True,
             )
         )

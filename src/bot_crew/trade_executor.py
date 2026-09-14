@@ -10,6 +10,7 @@
 # нужен вовсе). Общий код здесь предотвращает дублирование логики учёта
 # позиций/комиссий/уведомлений между двумя источниками сигналов.
 # =============================================================================
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -65,6 +66,7 @@ def open_structured_signal(
     spread_percent=None,
     notifier=None,
     amount_usdt=None,
+    extra_position_fields: dict = None,
 ) -> str:
     """Открывает обе ноги спреда и ставит позицию на учёт (position_store)
     для последующего закрытия. Возвращает текстовый отчёт.
@@ -77,6 +79,13 @@ def open_structured_signal(
     общий TRADE_SIZE_USDT из .env, см. trade_tool.py). Используется, например,
     scanner.py, у которого свой отдельный размер сделки (AUTO_TRADE_AMOUNT_USDT).
 
+    extra_position_fields (добавлено 2026-09-12, реальный случай ANTHROPIC
+    — см. _finalize_open) — произвольные дополнительные поля, которые
+    нужно сохранить в position_store ВМЕСТЕ с позицией (например,
+    "wide_spread": True/False у scanner.py) — иначе такие метки живут
+    ТОЛЬКО в памяти (test_batch.TestBatchPosition) и теряются при любом
+    рестарте бота, когда позиция восстанавливается заново из файла.
+
     notifier (опционально) — если передан, СРАЗУ после того, как ордера
     реально отправлены на биржи (result уже получен от tool.open_spread),
     шлёт мгновенное Telegram-уведомление — ДО дальнейшей обработки (расчёт
@@ -84,17 +93,63 @@ def open_structured_signal(
     может упасть с ошибкой уже ПОСЛЕ того, как сделка реально совершена."""
     tool = TradeExecutionTool()
     result = tool.open_spread(coin, long_exchange, short_exchange, amount_usdt=amount_usdt)
+    return _finalize_open(result, spread_percent, notifier, extra_position_fields)
 
-    # tool.open_spread() может ПОМЕНЯТЬ long_exchange/short_exchange МЕСТАМИ
-    # (см. "ПРОВЕРКА НАПРАВЛЕНИЯ ВХОДА" в trade_tool.py:_open_both_legs_async) —
-    # если к моменту исполнения long-биржа сигнала оказалась ДОРОЖЕ
-    # short-биржи (реальный случай с XRP 2026-09-06: канал назвал LONG
-    # биржу, ставшую дороже — вошли бы с отрицательным спредом). Дальше по
-    # функции ВСЕГДА ориентируемся на то, что РЕАЛЬНО произошло (result), а
-    # не на исходные аргументы сигнала — иначе отчёт/уведомление/
-    # position_store подпишут ноги под неверную биржу.
-    long_exchange = result.get("long_exchange", long_exchange)
-    short_exchange = result.get("short_exchange", short_exchange)
+
+async def open_structured_signal_async(
+    coin: str,
+    long_exchange: str,
+    short_exchange: str,
+    spread_percent=None,
+    notifier=None,
+    amount_usdt=None,
+    extra_position_fields: dict = None,
+    prefetched_books=None,
+    prefetched_books_at=None,
+) -> str:
+    """То же самое, что open_structured_signal(), но НАПРЯМУЮ await'ит
+    TradeExecutionTool._open_both_legs_async() вместо tool.open_spread()
+    (синхронная обёртка через _run_coro_blocking — та же двойная петля
+    "поток -> run_coroutine_threadsafe -> обратно на loop бота", что была
+    у close_spread() до 2026-09-10, см. close_structured_signal_detailed_async).
+
+    По прямой просьбе пользователя 2026-09-11 ("как ускорить открытие и
+    закрытие ног") — вызывающий код (scanner.py: _trigger_trade/
+    _trigger_test_batch_trade) сам УЖЕ работает на event loop бота, поэтому
+    вместо run_in_executor(execute_arbitrage_trade) (создаёт НОВЫЙ поток +
+    внутри него ещё и planning корутины обратно на loop бота через
+    run_coroutine_threadsafe, с блокировкой этого потока в ожидании) — тот
+    же самый event loop просто await'ит корутину напрямую. Экономит
+    создание потока и одно лишнее переключение контекста между вызовом и
+    реальной отправкой ордеров открытия на биржи (тот же выигрыш, что
+    закрытие уже получило раньше)."""
+    tool = TradeExecutionTool()
+    result = await tool._open_both_legs_async(
+        coin, long_exchange, short_exchange, amount_usdt=amount_usdt,
+        prefetched_books=prefetched_books, prefetched_books_at=prefetched_books_at,
+    )
+    return _finalize_open(result, spread_percent, notifier, extra_position_fields)
+
+
+def _finalize_open(result: dict, spread_percent, notifier, extra_position_fields: dict = None) -> str:
+    """Общая часть open_structured_signal()/_async() ПОСЛЕ того, как result
+    (dict от _open_both_legs_async, синхронно или через await) уже получен
+    — уведомление, отчёт, запись в position_store. Вынесено в отдельную
+    функцию по тому же принципу, что и _finalize_close (не дублировать
+    ~150 строк форматирования/учёта между sync- и async-вариантами)."""
+    # _open_both_legs_async() может ПОМЕНЯТЬ long_exchange/short_exchange
+    # МЕСТАМИ (см. "ПРОВЕРКА НАПРАВЛЕНИЯ ВХОДА" в
+    # trade_tool.py:_open_both_legs_async) — если к моменту исполнения
+    # long-биржа сигнала оказалась ДОРОЖЕ short-биржи (реальный случай с
+    # XRP 2026-09-06: канал назвал LONG биржу, ставшую дороже — вошли бы с
+    # отрицательным спредом). Ниже ВСЕГДА ориентируемся на то, что РЕАЛЬНО
+    # произошло (result), а не на исходные аргументы сигнала — иначе
+    # отчёт/уведомление/position_store подпишут ноги под неверную биржу.
+    # Ключей может не быть в cancelled-ветке (сделка отменена ДО того, как
+    # _open_both_legs_async успела определить финальное направление) —
+    # там они и не нужны, cancelled-ответ ниже их не использует.
+    long_exchange = result.get("long_exchange")
+    short_exchange = result.get("short_exchange")
 
     if result["cancelled"]:
         if notifier:
@@ -106,7 +161,17 @@ def open_structured_signal(
 
     long_leg, short_leg = result["long"], result["short"]
     ok_statuses = ("OK", "DRY_RUN_OK")
-    both_ok = long_leg["status"] in ok_statuses and short_leg["status"] in ok_statuses
+    long_ok = long_leg["status"] in ok_statuses
+    short_ok = short_leg["status"] in ok_statuses
+    both_ok = long_ok and short_ok
+    # Ни одна нога не открылась вообще (реальный случай 2026-09-12:
+    # MICRODUCK — обе ноги отклонены биржами: mexc "contract not
+    # activated", gate "insufficient margin") — откатывать НЕЧЕГО, деньги
+    # не потрачены, риска нет. В ОТЛИЧИЕ от случая "одна нога открылась, а
+    # rollback второй не удался" (см. ниже), это безопасный исход, и
+    # тревожная формулировка "ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА" тут вводила в
+    # заблуждение — исправлено по прямой обратной связи пользователя.
+    neither_opened = not long_ok and not short_ok
 
     # --- Мгновенное уведомление — сразу после исполнения ордеров -----------
     if notifier:
@@ -119,14 +184,16 @@ def open_structured_signal(
                     short_exchange=short_exchange,
                     short_price=short_leg.get("price"),
                     spread=spread_percent,
+                    elapsed_ms=result.get("elapsed_ms"),
                 )
             else:
                 rollback = long_leg.get("rollback") or short_leg.get("rollback")
-                rollback_note = (
-                    f" Открывшаяся нога автоматически закрыта (rollback: {rollback['status']})."
-                    if rollback
-                    else " ⚠️ Ни одна нога не была закрыта автоматически — проверьте вручную!"
-                )
+                if rollback:
+                    rollback_note = f" Открывшаяся нога автоматически закрыта (rollback: {rollback['status']})."
+                elif neither_opened:
+                    rollback_note = " Ни одна нога не открылась — деньги не потрачены, откатывать нечего, действие не требуется."
+                else:
+                    rollback_note = " ⚠️ Одна нога открылась, а автоматический откат не удался — проверьте вручную!"
                 notifier.notify_error(
                     symbol=result["coin"],
                     error_message=(
@@ -164,26 +231,52 @@ def open_structured_signal(
         # Записываем позицию на учёт — по ней должен прийти "aligned in"
         # (или закрывающий сигнал сканера), и тогда close_structured_signal()
         # найдёт её здесь.
-        position_store.record_open(
-            result["coin"],
-            {
-                "coin": result["coin"],
-                "long_exchange": long_exchange,
-                "short_exchange": short_exchange,
-                "long_amount_coin": long_leg.get("amount_coin"),
-                "short_amount_coin": short_leg.get("amount_coin"),
-                "long_entry_price": long_leg.get("price"),
-                "short_entry_price": short_leg.get("price"),
-                "amount_usdt": long_leg.get("amount_usdt"),
-                "leverage": result.get("leverage"),
-                "long_order_id": long_leg.get("order_id"),
-                "short_order_id": short_leg.get("order_id"),
-                "long_entry_fee_usdt": long_leg.get("fee_usdt"),
-                "short_entry_fee_usdt": short_leg.get("fee_usdt"),
-                "long_taker_fee_rate": long_leg.get("taker_fee_rate"),
-                "short_taker_fee_rate": short_leg.get("taker_fee_rate"),
-            },
-        )
+        position_fields = {
+            "coin": result["coin"],
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "long_amount_coin": long_leg.get("amount_coin"),
+            "short_amount_coin": short_leg.get("amount_coin"),
+            "long_entry_price": long_leg.get("price"),
+            "short_entry_price": short_leg.get("price"),
+            "amount_usdt": long_leg.get("amount_usdt"),
+            "leverage": result.get("leverage"),
+            "long_order_id": long_leg.get("order_id"),
+            "short_order_id": short_leg.get("order_id"),
+            "long_entry_fee_usdt": long_leg.get("fee_usdt"),
+            "short_entry_fee_usdt": short_leg.get("fee_usdt"),
+            "long_taker_fee_rate": long_leg.get("taker_fee_rate"),
+            "short_taker_fee_rate": short_leg.get("taker_fee_rate"),
+        }
+        # См. docstring extra_position_fields выше — реальный случай
+        # 2026-09-12 (ANTHROPIC): без этого "wide_spread": True терялся
+        # при каждом рестарте бота, и позиция после рестарта незаметно
+        # переключалась на ОБЫЧНЫЕ правила закрытия вместо тех, что
+        # реально были в силе на момент открытия.
+        if extra_position_fields:
+            position_fields.update(extra_position_fields)
+        position_store.record_open(result["coin"], position_fields)
+
+        # ЗАПИСЬ "OPEN" В ЖУРНАЛ (добавлено 2026-09-12, по прямой просьбе
+        # пользователя — ежедневный отчёт "задержка на ноги + PnL за
+        # сутки", см. trade_ledger.daily_stats/scanner.py:_daily_report_
+        # loop) — раньше журнал писал ТОЛЬКО закрытые сделки; задержка при
+        # ОТКРЫТИИ (result["elapsed_ms"] — "Задержка между ногами" в
+        # текстовом отчёте ниже) нигде не сохранялась персистентно, только
+        # мелькала в консоли/Telegram и терялась. Сбой самой записи не
+        # должен мешать открытой сделке — trade_ledger.record_trade сам
+        # никогда не бросает исключение наружу.
+        trade_ledger.record_trade({
+            "event": "open",
+            "coin": result["coin"],
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "elapsed_ms": result.get("elapsed_ms"),
+            # Разбивка задержки по этапам (стакан/проверки/ордера/комиссии)
+            # — см. timings в trade_tool.py:_open_both_legs_async.
+            "timings": result.get("timings"),
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        })
         report_lines.append(
             '✅ Позиция поставлена на учёт — будет закрыта по сигналу '
             '"aligned in" из канала (или сканером, если спред сойдётся).'
@@ -202,10 +295,15 @@ def open_structured_signal(
                 f"АВТОМАТИЧЕСКИ закрыта (rollback): {rollback['status']} "
                 f"(order_id={rollback.get('order_id')}). Незахеджированной позиции не осталось."
             )
+        elif neither_opened:
+            report_lines.append(
+                "Ни одна нога не открылась ни на одной бирже — деньги не потрачены, "
+                "откатывать нечего, наличие позиции проверять не нужно."
+            )
         else:
             report_lines.append(
-                "⚠️ ВНИМАНИЕ: не все ноги открылись успешно, и автоматический "
-                "откат не удался (или не потребовался определить объём) — "
+                "⚠️ ВНИМАНИЕ: одна нога открылась, а автоматический откат "
+                "второй не удался (или не удалось определить объём) — "
                 "проверьте вручную на биржах!"
             )
 
@@ -263,7 +361,69 @@ def close_structured_signal_detailed(coin: str, notifier=None, reason: str = Non
     return _finalize_close(coin, position, close_result, notifier, reason)
 
 
-async def close_structured_signal_detailed_async(coin: str, notifier=None, reason: str = None) -> Optional[dict]:
+async def _verify_close_still_worth_it(coin: str, position: dict, min_net_pnl: float) -> "tuple[bool, float | None]":
+    """ФИНАЛЬНАЯ проверка ПРЯМО ПЕРЕД отправкой ордеров закрытия: пересчитывает
+    чистый PnL по ЖИВОМУ стакану (VWAP на реальный объём позиции) и говорит,
+    стоит ли закрываться ПРЯМО СЕЙЧАС. Возвращает (стоит_ли, пересчитанный_net_pnl).
+
+    Добавлено 2026-09-13 по прямой просьбе пользователя после разбора реальной
+    сделки STORJ: решение о закрытии принималось при спреде 0.99%, а РЕАЛЬНЫЕ
+    цены исполнения дали спред 3.28% — монета в тот момент падала на 12%, и
+    книги gate/mexc разъехались за те ~1.4с, что шло исполнение. Итог -$0.05
+    вместо ожидаемой прибыли.
+
+    Ассиметрия, которую это закрывает: у ОТКРЫТИЯ такой гейт есть давно (см.
+    "ПРОВЕРКА АКТУАЛЬНОСТИ СПРЕДА" в trade_tool.py:_open_both_legs_async —
+    сделка отменяется ДО отправки ордеров, если спред ушёл), а у ЗАКРЫТИЯ не
+    было ничего: решили -> сразу шлём рыночные ордера, что бы ни стало с ценой.
+
+    ВАЖНО — fail-OPEN: если стакан получить не удалось (сеть, пустая книга,
+    нет цен входа), возвращаем True (закрываемся). Позиция, которая НЕ МОЖЕТ
+    закрыться из-за сбоя этой проверки — хуже, чем закрытие по чуть худшей
+    цене: висящая позиция копит риск неограниченно. Гейт нужен против
+    ПРЕДСКАЗУЕМО плохого исполнения, а не против любой неопределённости."""
+    long_entry = position.get("long_entry_price")
+    short_entry = position.get("short_entry_price")
+    long_amount = position.get("long_amount_coin")
+    short_amount = position.get("short_amount_coin")
+    amount_usdt = position.get("amount_usdt")
+    if not long_entry or not short_entry or not long_amount or not short_amount or not amount_usdt:
+        return True, None  # нечем считать — не блокируем закрытие (см. fail-open выше)
+
+    tool = TradeExecutionTool()
+    try:
+        long_snapshot, short_snapshot = await asyncio.gather(
+            tool._get_book_snapshot(position["long_exchange"], coin, amount_usdt),
+            tool._get_book_snapshot(position["short_exchange"], coin, amount_usdt),
+        )
+    except Exception as exc:
+        print(f"[close-check] {coin}: не удалось получить стакан ({type(exc).__name__}: {exc}) — закрываю без проверки.")
+        return True, None
+    if not long_snapshot or not short_snapshot:
+        return True, None
+
+    # LONG закрывается ПРОДАЖЕЙ (walk по bids -> sell_vwap), SHORT —
+    # ПОКУПКОЙ (walk по asks -> buy_vwap). Та же логика, что и в
+    # scanner.py:check_close_vwap, только на секунду позже — прямо перед
+    # самой отправкой ордеров.
+    long_exit = long_snapshot.get("sell_vwap")
+    short_exit = short_snapshot.get("buy_vwap")
+    if not long_exit or not short_exit:
+        return True, None
+
+    gross = (long_exit - long_entry) * long_amount + (short_entry - short_exit) * short_amount
+    entry_fee_total = _sum_fees_values(
+        position.get("long_entry_fee_usdt"), position.get("short_entry_fee_usdt")
+    )
+    # Комиссию за ВЫХОД оцениваем той же суммой, что и за вход (тот же
+    # объём/биржи) — тот же приём, что и в scanner.py:_estimate_total_pnl.
+    net = gross - entry_fee_total * 2 if entry_fee_total is not None else gross
+    return net > min_net_pnl, net
+
+
+async def close_structured_signal_detailed_async(
+    coin: str, notifier=None, reason: str = None, min_net_pnl: "float | None" = None
+) -> Optional[dict]:
     """То же самое, что close_structured_signal_detailed(), но НАПРЯМУЮ
     await'ит TradeExecutionTool._close_both_legs_async() вместо
     tool.close_spread() (синхронная обёртка, которая внутри либо создаёт
@@ -287,6 +447,42 @@ async def close_structured_signal_detailed_async(coin: str, notifier=None, reaso
     dry_run_result = _pop_dry_run_position(coin, position)
     if dry_run_result is not None:
         return dry_run_result
+
+    # min_net_pnl (добавлено 2026-09-13) — если передан, ПРЯМО ПЕРЕД
+    # отправкой ордеров пересчитываем PnL по живому стакану и отменяем
+    # закрытие, если прибыль успела испариться (см.
+    # _verify_close_still_worth_it, реальный случай STORJ). Передаёт его
+    # только ДОБРОВОЛЬНОЕ закрытие "по прибыли" из scanner.py — вынужденные
+    # закрытия (сигнал канала, reconcile) его НЕ передают и работают как
+    # раньше: позицию, которую надо закрыть по внешней причине, эта
+    # проверка блокировать не должна.
+    if min_net_pnl is not None:
+        worth_it, fresh_net = await _verify_close_still_worth_it(coin, position, min_net_pnl)
+        if not worth_it:
+            print(
+                f"[close-check] {coin}: ОТМЕНЯЮ закрытие — по свежему стакану чистый PnL "
+                f"{fresh_net:+.4f} USDT (порог {min_net_pnl:+.4f}). Позиция остаётся открытой, "
+                f"следующий цикл мониторинга проверит снова."
+            )
+            # both_ok=False -> вызывающий код (scanner.py:_close_test_batch_
+            # position) оставляет позицию в мониторинге и попробует снова
+            # на следующем цикле. Уведомление НЕ шлём: это не ошибка, а
+            # штатное "ещё не время".
+            return {
+                "report": f"Монета: {coin}\nЗакрытие отменено: прибыль не подтвердилась по свежему стакану.",
+                "both_ok": False,
+                "close_aborted": True,
+                "fresh_net_pnl": fresh_net,
+                "position": position,
+                "long_leg": None,
+                "short_leg": None,
+                "long_pnl": None,
+                "short_pnl": None,
+                "gross_pnl": None,
+                "gross_pnl_pct": None,
+                "net_pnl": None,
+                "net_pnl_pct": None,
+            }
 
     tool = TradeExecutionTool()
     close_result = await tool._close_both_legs_async(
@@ -403,6 +599,7 @@ def _finalize_close(coin: str, position: dict, close_result: dict, notifier=None
                     reason=close_reason,
                     pnl_amount=final_pnl,
                     pnl_percent=final_pnl_pct,
+                    elapsed_ms=close_result.get("elapsed_ms"),
                 )
             else:
                 notifier.notify_error(
@@ -457,6 +654,7 @@ def _finalize_close(coin: str, position: dict, close_result: dict, notifier=None
                 except ValueError:
                     pass
             trade_ledger.record_trade({
+                "event": "close",  # см. trade_ledger.daily_stats — отличает от "open"-записей
                 "coin": coin.upper(),
                 "long_exchange": position.get("long_exchange"),
                 "short_exchange": position.get("short_exchange"),
@@ -477,6 +675,7 @@ def _finalize_close(coin: str, position: dict, close_result: dict, notifier=None
                 "closed_at": datetime.now(timezone.utc).isoformat(),
                 "holding_seconds": holding_seconds,
                 "elapsed_ms": close_result.get("elapsed_ms"),
+                "timings": close_result.get("timings"),
             })
         except Exception as exc:
             print(f"[trade_ledger] сбой при записи сделки {coin}: {exc}")
@@ -524,6 +723,7 @@ def execute_arbitrage_trade(
     amount_usdt: float,
     spread_percent=None,
     notifier=None,
+    extra_position_fields: dict = None,
 ) -> str:
     """Исполняет рыночный вход в арбитражный спред: Market-ордер LONG на
     long_exchange + Market-ордер SHORT на short_exchange, объём amount_usdt
@@ -531,8 +731,37 @@ def execute_arbitrage_trade(
     исполнении — success/error по каждой ноге виден внутри него (см.
     open_structured_signal: статусы "OK"/"DRY_RUN_OK"/"ERROR: ..." на
     каждой ноге, что и есть логирование успеха/ошибки, которое вызывающий
-    код обычно сразу print()-ит — см. scanner.py:_trigger_trade)."""
+    код обычно сразу print()-ит — см. scanner.py:_trigger_trade).
+
+    extra_position_fields — см. open_structured_signal()/_finalize_open."""
     return open_structured_signal(
         symbol, long_exchange, short_exchange,
         spread_percent=spread_percent, notifier=notifier, amount_usdt=amount_usdt,
+        extra_position_fields=extra_position_fields,
+    )
+
+
+async def execute_arbitrage_trade_async(
+    symbol: str,
+    long_exchange: str,
+    short_exchange: str,
+    amount_usdt: float,
+    spread_percent=None,
+    notifier=None,
+    extra_position_fields: dict = None,
+    prefetched_books=None,
+    prefetched_books_at=None,
+) -> str:
+    """То же самое, что execute_arbitrage_trade(), но напрямую await'ит
+    open_structured_signal_async() — по прямой просьбе пользователя
+    2026-09-11 ("как ускорить открытие ног") заменяет
+    scanner.py:_trigger_trade/_trigger_test_batch_trade's
+    run_in_executor(execute_arbitrage_trade) (отдельный поток + двойная
+    петля обратно на loop бота) на прямой await на том же event loop бота,
+    на котором уже выполняется вызывающий код."""
+    return await open_structured_signal_async(
+        symbol, long_exchange, short_exchange,
+        spread_percent=spread_percent, notifier=notifier, amount_usdt=amount_usdt,
+        extra_position_fields=extra_position_fields,
+        prefetched_books=prefetched_books, prefetched_books_at=prefetched_books_at,
     )

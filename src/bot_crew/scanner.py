@@ -14,6 +14,7 @@
 # =============================================================================
 
 import asyncio
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -24,10 +25,15 @@ import ccxt.async_support as ccxt_async
 from bot_crew import position_store
 from bot_crew import blocked_coins_store
 from bot_crew import trade_executor
+from bot_crew import trade_ledger
+from bot_crew import book_stream
+from bot_crew import private_stream
+from bot_crew import clock_guard
 from bot_crew.config import load_auto_trade_config, load_test_batch_config
 from bot_crew import test_batch as test_batch_mod
 from bot_crew.test_batch import TestBatchTracker
 from bot_crew.tools.trade_tool import (
+    EXCHANGE_ALIASES,
     EXCHANGE_QUOTE_CURRENCY,
     TradeExecutionTool,
     _build_symbol,
@@ -41,6 +47,13 @@ from bot_crew.tools.trade_tool import (
 # дефолтами). Читаются один раз при создании FundingScanner — перезапуск
 # бота нужен, чтобы подхватить изменения (как и остальные настройки .env).
 # =============================================================================
+async def _already(value):
+    """Обёртка, чтобы в asyncio.gather() можно было смешивать реальные
+    запросы и уже готовые значения (см. check_close_vwap: одна нога взята
+    из потока, вторая требует REST)."""
+    return value
+
+
 def _get_bool_env(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() == "true"
 
@@ -195,6 +208,45 @@ class FundingScanner:
         # непокрытой, а position_store всё ещё думал, что обе ноги открыты.
         self._pending_missing_legs: dict = {}
 
+        # ГРЕЙС-ПЕРИОД ПОСЛЕ ОТКРЫТИЯ (добавлено 2026-09-11 — реальный
+        # случай STORJ: реконсиляция закрыла ЧЕТЫРЕ раза подряд абсолютно
+        # легитимно открытую позицию, приняв её за орфан/пропавшую ногу,
+        # чистый убыток ~$0.17+ на комиссиях/проскальзывании). КОРЕНЬ
+        # ПРОБЛЕМЫ: "два подтверждения подряд" (см. _pending_orphans выше)
+        # защищает от гонки, только если между двумя прогонами sweep
+        # реально проходит достаточно времени, чтобы сделка успела
+        # дописаться в position_store. После того как сегодня же убрали
+        # искусственную паузу реконсиляции (RECONCILE_INTERVAL_SECONDS=0)
+        # сама проверка 8 бирж стала занимать МЕНЬШЕ времени, чем реальное
+        # открытие обеих ног (~1.3-1.7с, см. "Задержка между ногами" в
+        # логах) — оба подтверждения подряд успевали произойти ДО того,
+        # как position_store вообще узнавал о сделке, и "защита от гонки"
+        # переставала защищать. Фикс — НЕЗАВИСИМЫЙ от скорости самих
+        # sweep'ов: помечаем момент СТАРТА попытки открытия (до отправки
+        # ордеров) и полностью игнорируем эту монету в reconcile, пока не
+        # прошёл SCANNER_RECONCILE_OPEN_GRACE_SECONDS — реальному открытию
+        # с огромным запасом хватает этого времени дописаться в учёт,
+        # сколько бы раз sweep ни прошёл за этот период.
+        self._recent_open_attempts: dict = {}
+
+        # Когда по каждой бирже в последний раз делали ПОЛНЫЙ REST-снимок
+        # позиций (см. _positions_for_reconcile). Приватный поток
+        # (private_stream.py) избавляет сверку от постоянного REST, но
+        # опираться на него бессрочно нельзя: незамеченное расхождение
+        # (пропущенная дельта, рассинхрон после переподключения) иначе жило
+        # бы сколь угодно долго. Поэтому REST принудительно вызывается не
+        # реже RECONCILE_REST_VERIFY_SECONDS — верхняя граница на возраст
+        # любой ошибки потока.
+        self._last_rest_verify: dict = {}
+
+        # СОСТОЯНИЕ СИСТЕМНЫХ ЧАСОВ (см. clock_guard.py и _clock_guard_loop).
+        # False = часы расходятся с биржами сильнее допустимого, НОВЫЕ
+        # ВХОДЫ ЗАПРЕЩЕНЫ (см. _handle_test_batch_opportunity). Стартуем с
+        # True, чтобы не блокировать торговлю до первого замера — первый
+        # замер делается сразу при запуске цикла, ещё до первого скана.
+        self._clock_ok: bool = True
+        self._clock_last_alert_at: float = 0.0
+
         # РАЗОВОЕ ИСКЛЮЧЕНИЕ из правила "1 нога на биржу" (см.
         # busy_exchanges выше) — по явной просьбе пользователя 2026-09-08:
         # "разрешаю сделать разовое исключение для mexc и gate, но только 1
@@ -259,7 +311,8 @@ class FundingScanner:
         )
         if self.test_batch is not None:
             print(
-                f"[test_batch] ВКЛЮЧЁН: серия из {self.test_batch.size} сделок по "
+                f"[test_batch] ВКЛЮЧЁН: "
+                f"{'НЕПРЕРЫВНЫЙ РЕЖИМ (без лимита сделок)' if self.test_batch.unlimited else f'серия из {self.test_batch.size} сделок'} по "
                 f"${self.test_batch.amount_usdt}, вход при спреде >= {self.test_batch.min_spread_pct}%, "
                 f"закрытие при спреде {self.test_batch.close_spread_pct}%-"
                 f"{self.test_batch.close_spread_max_pct}% и прибыли, "
@@ -284,7 +337,10 @@ class FundingScanner:
     # -------------------------------------------------------------------
     def _bootstrap_test_batch_from_position_store(self) -> None:
         for coin, pos in position_store.list_positions().items():
-            if self.test_batch.opened_count >= self.test_batch.size:
+            # В непрерывном режиме (size<=0) лимита нет — восстанавливаем
+            # ВСЕ найденные в учёте позиции, иначе часть осталась бы без
+            # мониторинга после рестарта.
+            if not self.test_batch.unlimited and self.test_batch.opened_count >= self.test_batch.size:
                 break
             try:
                 long_exchange = pos["long_exchange"]
@@ -318,6 +374,15 @@ class FundingScanner:
                         if pos.get("long_entry_fee_usdt") is not None or pos.get("short_entry_fee_usdt") is not None
                         else None
                     ),
+                    # ИСПРАВЛЕНО 2026-09-12 (реальный случай ANTHROPIC) —
+                    # раньше wide_spread тут не передавался вообще, и
+                    # ЛЮБАЯ "широкая" позиция (правило 2%-тейк-профит без
+                    # лимита) при каждом рестарте бота тихо превращалась в
+                    # обычную (правило: спред <=1% и прибыль >=$0.15) —
+                    # пометка хранилась ТОЛЬКО в памяти, а не в файле.
+                    # Теперь _finalize_open пишет её в position_store, и
+                    # здесь она читается обратно.
+                    wide_spread=bool(pos.get("wide_spread")),
                 )
                 print(
                     f"[test_batch] Восстановлена позиция {coin} из position_store после рестарта: "
@@ -354,9 +419,33 @@ class FundingScanner:
         # просьбе пользователя 2026-09-10 после реального инцидента с
         # неучтённой позицией LAB на MEXC (-$2.57).
         self._reconcile_task = asyncio.create_task(self._reconcile_positions_loop())
+        # См. _daily_report_loop — раз в сутки шлёт сводку (задержки на
+        # ноги + PnL за сутки) в @Depositik/@G_Pobedonosec, по прямой
+        # просьбе пользователя 2026-09-12.
+        self._daily_report_task = asyncio.create_task(self._daily_report_loop())
+        # См. _clock_guard_loop / clock_guard.py — контроль системных часов
+        # против времени бирж, добавлен 2026-09-14 после реального случая,
+        # когда часы ПК отставали на 3ч42м и ни один подписанный запрос не
+        # проходил, а бот при этом выглядел исправным.
+        self._clock_guard_task = asyncio.create_task(self._clock_guard_loop())
         try:
             while True:
                 cycle_start = time.monotonic()
+                # ОБНОВЛЕНИЕ SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS КАЖДЫЙ
+                # ЦИКЛ (добавлено 2026-09-12 — реальный случай MICRODUCK):
+                # auto_exclude_coin_on_exchange() пишет новую пару в .env
+                # и os.environ МГНОВЕННО в момент отката, но self.excluded_
+                # coin_exchange_pairs раньше парсился ОДИН РАЗ в __init__ —
+                # монета, которую только что исключили, продолжала
+                # находиться и пытаться открыться СОТНИ раз за тот же
+                # запуск бота, пока кто-то не перезапустит процесс вручную.
+                # Разбор короткой строки из os.environ — не сетевой вызов,
+                # микросекунды, поэтому делать это КАЖДЫЙ цикл (а не только
+                # при старте) ничего не стоит, зато новое исключение
+                # подхватывается сразу же, без рестарта.
+                self.excluded_coin_exchange_pairs = blocked_coins_store.parse_coin_exchange_pairs(
+                    os.getenv("SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS", "")
+                )
                 try:
                     # ЗАЩИТА ОТ ЗАВИСАНИЯ: без явного таймаута один
                     # зависший сетевой вызов (биржа не отвечает, но и не
@@ -391,6 +480,14 @@ class FundingScanner:
                     # выполняющуюся попытку открытия — как раз то, что
                     # вызвало гонку выше.
                     await self._handle_opportunities(opportunities)
+
+                    # ФОНОВЫЙ ПРОГРЕВ ПЛЕЧА (добавлено 2026-09-14 по прямой
+                    # просьбе пользователя "сделать так, чтобы везде стояло
+                    # 5 плечо и тратить на открытие ещё меньше времени").
+                    # Запускаем ПОСЛЕ обработки связок и НЕ ждём результата:
+                    # это чистая подготовка на будущее, она не должна ни на
+                    # миллисекунду задерживать текущий цикл или сделку.
+                    asyncio.create_task(self._warm_leverage_for_candidates(opportunities))
                 except asyncio.TimeoutError:
                     print(
                         f"[scanner] Цикл сканирования не уложился в "
@@ -521,6 +618,11 @@ class FundingScanner:
             if self.test_batch is None or self.test_batch.state == test_batch_mod.DONE:
                 return
             try:
+                # Синхронизация потоковых подписок — БЕЗУСЛОВНО, вне
+                # проверки на наличие позиций: когда закрывается последняя,
+                # _monitor_test_batch() уже не вызывается, и висящие
+                # подписки надо снять именно здесь.
+                await self._sync_book_streams()
                 if self.test_batch.open_positions:
                     await asyncio.wait_for(self._monitor_test_batch(), timeout=self._cycle_timeout_seconds)
             except asyncio.TimeoutError:
@@ -554,13 +656,259 @@ class FundingScanner:
     # кто-то заметит вручную.
     # -------------------------------------------------------------------
     async def _reconcile_positions_loop(self) -> None:
+        # По прямой просьбе пользователя 2026-09-10 — без искусственной
+        # паузы (RECONCILE_INTERVAL_SECONDS=0), тот же принцип, что и у
+        # остальных двух циклов (сканирование, мониторинг закрытия): пол
+        # 0.02с — не "время ожидания", а техническая защита от чистого
+        # busy-loop, если сам прогон вдруг завершится мгновенно. Сама
+        # сверка (8 бирж, реальные сетевые запросы) и так занимает
+        # секунды — ДВА ПОДТВЕРЖДЕНИЯ ПОДРЯД (см. _reconcile_orphaned_
+        # positions) от этого не страдают: легитимная сделка успевает
+        # записаться в position_store (обычно 1.5-5с на открытие) задолго
+        # до того, как следующий прогон дойдёт до той же биржи повторно.
         interval = _get_float_env("RECONCILE_INTERVAL_SECONDS", 60.0)
         while True:
             try:
                 await self._reconcile_orphaned_positions()
             except Exception as exc:
                 print(f"[reconcile] Ошибка сверки позиций: {type(exc).__name__}: {exc}")
-            await asyncio.sleep(max(10.0, interval))
+            await asyncio.sleep(max(0.02, interval))
+
+    # -------------------------------------------------------------------
+    # _daily_report_loop — раз в сутки (вскоре после полуночи UTC) шлёт
+    # сводку за ПРОШЕДШИЕ сутки (открытия/закрытия, средняя задержка между
+    # ногами на вход и на выход, итоговый PnL) в @Depositik/@G_Pobedonosec
+    # — по прямой просьбе пользователя 2026-09-12. Дата последней отправки
+    # хранится в маленьком JSON-файле (тот же принцип, что и у
+    # position_store/blocked_coins_store) — переживает рестарт бота, не
+    # шлёт отчёт повторно за уже отправленные сутки, даже если бот
+    # перезапускали несколько раз в течение дня.
+    # -------------------------------------------------------------------
+    async def _clock_guard_loop(self) -> None:
+        """Периодически сверяет системные часы с биржами (см. clock_guard.py).
+
+        Первый замер — НЕМЕДЛЕННО при старте, чтобы бот с кривыми часами
+        не успел даже начать искать входы. Дальше — раз в
+        CLOCK_CHECK_INTERVAL_SECONDS: часы могут уехать и посреди работы
+        (сон/пробуждение ноутбука, смена часового пояса, ручная правка).
+
+        Алерт при проблеме — владельцу и обоим получателям отчётов
+        (@Depositik/@G_Pobedonosec): это не техническая мелочь, а полная
+        остановка торговли. Повторяем не чаще раза в CLOCK_ALERT_EVERY_
+        SECONDS, пока проблема держится, и отдельно сообщаем о
+        восстановлении — иначе непонятно, можно ли уже перестать волноваться."""
+        interval = _get_float_env("CLOCK_CHECK_INTERVAL_SECONDS", 120.0)
+        realert_every = _get_float_env("CLOCK_ALERT_EVERY_SECONDS", 600.0)
+        # ДВА ПЛОХИХ ЗАМЕРА ПОДРЯД, прежде чем блокировать торговлю — тот же
+        # принцип "перепроверь, не спеши", что и у сверки позиций. Первый
+        # боевой запуск 2026-09-14 дал ложную тревогу с одного замера под
+        # стартовой нагрузкой; блокировать входы по единичному шумному
+        # числу нельзя. Подозрительный замер перепроверяем быстро (через
+        # CLOCK_RECHECK_SECONDS), а не через полный интервал.
+        recheck_after = _get_float_env("CLOCK_RECHECK_SECONDS", 20.0)
+        suspicious = False
+        while True:
+            sleep_for = max(10.0, interval)
+            try:
+                offset = await clock_guard.measure_offset()
+                if offset is None:
+                    print("[clock] не удалось получить время ни одной опорной биржи — пропускаю проверку (сеть?).")
+                elif abs(offset) > clock_guard.max_offset_seconds() and not suspicious and self._clock_ok:
+                    # Первое подозрение — только запоминаем и быстро перепроверяем.
+                    suspicious = True
+                    sleep_for = recheck_after
+                    print(f"[clock] подозрение: {clock_guard.describe(offset)} — перепроверю через {recheck_after:.0f}с.")
+                elif abs(offset) > clock_guard.max_offset_seconds():
+                    suspicious = False
+                    was_ok = self._clock_ok
+                    self._clock_ok = False
+                    now = time.monotonic()
+                    if was_ok or now - self._clock_last_alert_at >= realert_every:
+                        self._clock_last_alert_at = now
+                        msg = (
+                            f"🕒 {clock_guard.describe(offset)}. Биржи отвергают ВСЕ подписанные "
+                            f"запросы (recvWindow/REQUEST_EXPIRED) — бот НЕ МОЖЕТ ни открывать, "
+                            f"ни закрывать позиции. НОВЫЕ ВХОДЫ ЗАПРЕЩЕНЫ до исправления. "
+                            f"Починить: Параметры → Время и язык → «Синхронизировать сейчас», "
+                            f"либо от администратора: net start w32time && w32tm /resync /force."
+                        )
+                        print(f"[clock] {msg}")
+                        try:
+                            self.notifier.notify_error(symbol="СИСТЕМНЫЕ ЧАСЫ", error_message=msg)
+                        except Exception:
+                            pass
+                else:
+                    suspicious = False
+                    if not self._clock_ok:
+                        self._clock_ok = True
+                        msg = f"✅ Часы выровнены ({clock_guard.describe(offset)}) — торговля разрешена снова."
+                        print(f"[clock] {msg}")
+                        try:
+                            self.notifier.notify_error(symbol="СИСТЕМНЫЕ ЧАСЫ", error_message=msg)
+                        except Exception:
+                            pass
+                    else:
+                        print(f"[clock] ок: расхождение с биржами {offset:+.2f} с.")
+            except Exception as exc:
+                print(f"[clock] ошибка проверки часов: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(sleep_for)
+
+    async def _daily_report_loop(self) -> None:
+        state_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "daily_report_state.json",
+        )
+
+        def _load_last_sent():
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    return json.loads(f.read()).get("last_sent_date")
+            except (OSError, json.JSONDecodeError):
+                return None
+
+        def _save_last_sent(date_str: str):
+            try:
+                with open(state_path, "w", encoding="utf-8") as f:
+                    json.dump({"last_sent_date": date_str}, f)
+            except OSError as exc:
+                print(f"[daily-report] не удалось сохранить состояние: {exc}")
+
+        last_sent = _load_last_sent()
+        # При самом первом запуске (файла ещё нет) НЕ шлём отчёт немедленно
+        # за "вчера" — незачем присылать сводку в момент случайного
+        # рестарта посреди дня. Просто запоминаем текущую дату как
+        # "последнюю отправленную" и ждём следующей смены суток.
+        if last_sent is None:
+            last_sent = datetime.now(timezone.utc).date().isoformat()
+            _save_last_sent(last_sent)
+
+        while True:
+            await asyncio.sleep(600)  # проверка раз в 10 минут — не нужна ежесекундная точность
+            today_str = datetime.now(timezone.utc).date().isoformat()
+            if today_str == last_sent:
+                continue
+            # Дата сменилась — отчёт за ПРОШЕДШИЕ сутки (last_sent, ещё не
+            # отправленные), не за today_str (те только начались).
+            try:
+                stats = trade_ledger.daily_stats(target_date=datetime.fromisoformat(last_sent).date())
+                self.notifier.notify_daily_report(
+                    date_str=stats["date"],
+                    opens_count=stats["opens_count"],
+                    closes_count=stats["closes_count"],
+                    avg_open_latency_ms=stats["avg_open_latency_ms"],
+                    avg_close_latency_ms=stats["avg_close_latency_ms"],
+                    total_net_pnl=stats["total_net_pnl"],
+                    wins=stats["wins"],
+                    losses=stats["losses"],
+                )
+                print(f"[daily-report] Отправлен отчёт за {stats['date']}.")
+            except Exception as exc:
+                print(f"[daily-report] Ошибка формирования/отправки отчёта: {exc}")
+            last_sent = today_str
+            _save_last_sent(last_sent)
+
+    def _in_open_grace_period(self, coin: str) -> bool:
+        """True, если попытка открыть эту монету стартовала недавно (см.
+        self._recent_open_attempts в __init__) — reconcile должен ПОЛНОСТЬЮ
+        пропустить её на этом прогоне, не начиная даже первое обнаружение
+        орфана/пропавшей ноги, пока не прошёл грейс-период."""
+        started_at = self._recent_open_attempts.get(coin.upper())
+        if started_at is None:
+            return False
+        grace_seconds = _get_float_env("SCANNER_RECONCILE_OPEN_GRACE_SECONDS", 20.0)
+        elapsed = time.monotonic() - started_at
+        if elapsed >= grace_seconds:
+            # Грейс-период истёк — можно забыть отметку (заодно не даёт
+            # словарю расти бесконечно за время жизни бота).
+            self._recent_open_attempts.pop(coin.upper(), None)
+            return False
+        return True
+
+    # -------------------------------------------------------------------
+    # _positions_for_reconcile — ОТКУДА сверка берёт список позиций биржи.
+    #
+    # Добавлено 2026-09-14 по прямой просьбе пользователя ("нельзя ли
+    # использовать такой же метод как со стаканом, чтобы обновлять данные
+    # по открытым ордерам без задержки"). Сверка крутится непрерывно и
+    # раньше на КАЖДОМ прогоне дёргала fetch_positions по всем семи
+    # биржам — постоянная нагрузка ради данных, которые почти всегда не
+    # меняются.
+    #
+    # ПРАВИЛО БЕЗОПАСНОСТИ (подробно — в шапке private_stream.py): поток
+    # принимается ТОЛЬКО как подтверждение того, что всё совпадает с
+    # учётом. Стоит картинке разойтись хоть в одну сторону — немедленно
+    # идём по REST и дальше работаем ИСКЛЮЧИТЕЛЬНО с ответом REST.
+    #
+    # Это принципиально, потому что расхождение ведёт к ДЕЙСТВИЯМ С
+    # ДЕНЬГАМИ: автозакрытию «неучтённой» позиции и закрытию оставшейся
+    # ноги при «пропавшей». Ошибись поток в пустую сторону (молча умерло
+    # соединение, пропущенная дельта) — бот закрыл бы живую позицию. При
+    # таком порядке цена ошибки потока равна нулю: он способен лишь
+    # сэкономить REST-запрос там, где и так всё в порядке, и не способен
+    # ничего решить там, где что-то не так.
+    #
+    # Возвращает (позиции, источник) — источник попадает в лог, чтобы
+    # всегда было видно, чем именно бот сейчас пользуется.
+    # -------------------------------------------------------------------
+    async def _positions_for_reconcile(self, tool, exchange_name: str, expected_coins: set):
+        async def _rest():
+            client = await tool._get_ready_client(exchange_name)
+            params = {"settle": "usdt"} if exchange_name == "gate" else {}
+            positions = await client.fetch_positions(params=params)
+            self._last_rest_verify[exchange_name] = time.monotonic()
+            return positions
+
+        streamed = private_stream.get_positions(exchange_name)
+        if streamed is None:
+            return await _rest(), "REST"
+
+        # Принудительная периодическая сверка по REST — верхняя граница на
+        # то, сколько может прожить незамеченное расхождение в потоке.
+        #
+        # ПОЧЕМУ ДВА РАЗНЫХ ИНТЕРВАЛА. Есть один сценарий, который
+        # сравнение "поток против учёта" поймать не может в принципе: если
+        # нога РЕАЛЬНО закрылась на бирже, а поток потерял это обновление
+        # (сообщение не дошло, но соединение не оборвалось — переподключения,
+        # а значит и пересева, не произошло), то поток и учёт согласованно
+        # врут одно и то же, расхождения нет, и REST не вызывается. Живём с
+        # этим ровно до следующей плановой сверки.
+        #
+        # Цена такой задержки совершенно разная в двух состояниях. Когда на
+        # бирже НЕТ наших ног, ошибка не стоит ничего — терять нечего, и
+        # редкий REST оправдан. Когда нога ЕСТЬ, это потенциально
+        # незахеджированная позиция, а незамеченный голый риск —
+        # исторически самая дорогая поломка этого бота (LAB -$2.57, CATE,
+        # STORJ). Поэтому при открытых ногах сверяемся заметно чаще: один
+        # REST-запрос в минуту на биржу — ничтожная цена против этого риска.
+        if expected_coins:
+            verify_after = _get_float_env("RECONCILE_REST_VERIFY_OPEN_SECONDS", 60.0)
+        else:
+            verify_after = _get_float_env("RECONCILE_REST_VERIFY_SECONDS", 300.0)
+        last = self._last_rest_verify.get(exchange_name)
+        if last is None or time.monotonic() - last > verify_after:
+            return await _rest(), "REST (плановая сверка потока)"
+
+        live_coins = set()
+        for p in streamed:
+            if abs(p.get("contracts") or 0) <= 0:
+                continue
+            symbol = p.get("symbol") or ""
+            coin = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
+            if coin:
+                live_coins.add(coin)
+
+        if live_coins != expected_coins:
+            # РАСХОЖДЕНИЕ — решает только REST, поток здесь лишь повод
+            # посмотреть внимательнее (и посмотреть НЕМЕДЛЕННО, а не на
+            # следующем прогоне: в этом и состоит выигрыш в отклике).
+            print(
+                f"[reconcile] {exchange_name}: поток показывает расхождение с учётом "
+                f"(поток={sorted(live_coins) or '—'}, учёт={sorted(expected_coins) or '—'}) "
+                f"— перепроверяю по REST."
+            )
+            return await _rest(), "REST (расхождение в потоке)"
+
+        return streamed, "поток"
 
     async def _reconcile_orphaned_positions(self) -> None:
         tool = TradeExecutionTool()
@@ -574,19 +922,55 @@ class FundingScanner:
                 if ex:
                     tracked_pairs.add((ex, coin.upper()))
 
+        # Приватные потоки поднимаются лениво и идемпотентно — здесь, а не
+        # при старте бота: сверка и так первый цикл, который ходит по всем
+        # биржам, а любая неудача подписки не мешает ей работать по REST.
+        try:
+            await tool.ensure_private_streams(self.test_batch_safe_exchanges)
+        except Exception as exc:
+            print(f"[private-stream] не удалось поднять потоки: {type(exc).__name__}: {exc}")
+
         orphans_found = 0
+        from_stream = 0
         checked_exchanges = 0
         checked_exchange_names = set()
         real_pairs = set()  # (exchange, coin) — реально найдены на бирже (для обратной проверки ниже)
         for exchange_name in self.test_batch_safe_exchanges:
+            # Монеты, которые МЫ считаем открытыми именно на этой бирже —
+            # эталон, с которым сравнивается поток (см.
+            # _positions_for_reconcile).
+            expected_coins = {c for (e, c) in tracked_pairs if e == exchange_name}
             try:
                 client = await tool._get_ready_client(exchange_name)
-                params = {"settle": "usdt"} if exchange_name == "gate" else {}
-                positions = await client.fetch_positions(params=params)
+                positions, source = await self._positions_for_reconcile(
+                    tool, exchange_name, expected_coins
+                )
             except Exception as exc:
                 print(f"[reconcile] {exchange_name}: не удалось проверить позиции ({type(exc).__name__}: {exc}).")
                 continue
             checked_exchanges += 1
+            if source == "поток":
+                from_stream += 1
+
+            # ФОНОВЫЙ ПРОГРЕВ КЭША БАЛАНСА (добавлено 2026-09-14 по прямой
+            # просьбе пользователя: "оставь как лучше для безопасности, но
+            # чтобы не ждать по 2-3 сек на вход"). Запрос баланса стоит
+            # 657-2015мс (замер по биржам), и раньше эту цену платил САМ
+            # ВХОД, когда кэш успевал протухнуть. Сверка позиций и так
+            # ходит по всем биржам непрерывно и находится ВНЕ критического
+            # пути — обновляем баланс здесь, и к моменту реальной сделки он
+            # почти всегда свежий (0мс на входе).
+            #
+            # Обновляем не на каждом прогоне, а только когда кэш реально
+            # постарел (см. BALANCE_WARMUP_AFTER_SECONDS): sweep крутится
+            # без пауз, и запрашивать баланс каждый круг — лишняя нагрузка
+            # на API, которая сама же и замедлит биржу.
+            try:
+                await tool._refresh_balance_if_stale(
+                    exchange_name, _get_float_env("BALANCE_WARMUP_AFTER_SECONDS", 25.0)
+                )
+            except Exception:
+                pass  # прогрев — вспомогательный, сбой не должен ломать сверку
             checked_exchange_names.add(exchange_name)
 
             for p in positions:
@@ -599,6 +983,15 @@ class FundingScanner:
                     continue
                 real_pairs.add((exchange_name, coin))
                 if (exchange_name, coin) in tracked_pairs:
+                    continue
+
+                # ГРЕЙС-ПЕРИОД (см. _in_open_grace_period, реальный случай
+                # STORJ 2026-09-11) — эта монета, возможно, ПРЯМО СЕЙЧАС
+                # легитимно открывается, но ещё не попала в position_store.
+                # Пропускаем полностью, даже не начиная отсчёт "два
+                # подтверждения подряд" — независимо от того, сколько раз
+                # sweep пройдёт за это время.
+                if self._in_open_grace_period(coin):
                     continue
 
                 # ВАЖНО (реальные инциденты 2026-09-10, IOST и потом CATE):
@@ -701,6 +1094,11 @@ class FundingScanner:
         missing_found = 0
         for coin, pos in list(tracked.items()):
             coin_upper = coin.upper()
+            # Тот же грейс-период, что и у прямой проверки выше — на
+            # случай если одна из ног ещё не успела отразиться на бирже
+            # (eventual consistency у самой биржи) сразу после открытия.
+            if self._in_open_grace_period(coin_upper):
+                continue
             for leg_key, other_key, other_amount_key in (
                 ("long_exchange", "short_exchange", "short_amount_coin"),
                 ("short_exchange", "long_exchange", "long_amount_coin"),
@@ -744,6 +1142,7 @@ class FundingScanner:
                             result = await tool._close_single_order(other_ex, coin_upper, other_side, amount)
                             done_msg = f"Оставшаяся нога {coin_upper} на {other_ex} закрыта: {result}"
                         else:
+                            result = None
                             done_msg = (
                                 f"{coin_upper}: не удалось определить объём для закрытия "
                                 f"оставшейся ноги на {other_ex} — ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА!"
@@ -753,6 +1152,67 @@ class FundingScanner:
                             self.notifier.notify_error(symbol=coin_upper, error_message=done_msg)
                         except Exception:
                             pass
+
+                        # ЗАПИСЬ В ЖУРНАЛ (добавлено 2026-09-11 по прямой
+                        # просьбе пользователя — запрос "посчитай точный
+                        # win-rate" выявил дыру: reconcile-закрытия вообще
+                        # не попадали в trade_ledger.jsonl, статистика была
+                        # неполной). Известна ТОЛЬКО судьба ноги, которую мы
+                        # только что закрыли реальным ордером (entry — из
+                        # pos, exit — из result); судьба ПРОПАВШЕЙ ноги (на
+                        # ex) неизвестна — она уже отсутствовала на бирже к
+                        # моменту этой проверки (скорее всего, закрыта тем
+                        # же reconcile отдельным более ранним событием
+                        # "орфан", со своей ценой, которую этот код не
+                        # видит). Пишем честно то, что знаем — с
+                        # partial_data=True, а не выдумываем вторую цену.
+                        if result and result.get("status") == "OK" and result.get("price") is not None:
+                            try:
+                                entry_price_key = "long_entry_price" if other_side == "long" else "short_entry_price"
+                                entry_fee_key = "long_entry_fee_usdt" if other_side == "long" else "short_entry_fee_usdt"
+                                entry_price = pos.get(entry_price_key)
+                                exit_price = result.get("price")
+                                entry_fee = pos.get(entry_fee_key)
+                                known_leg_pnl = None
+                                if entry_price is not None and exit_price is not None:
+                                    if other_side == "long":
+                                        known_leg_pnl = (exit_price - entry_price) * amount
+                                    else:
+                                        known_leg_pnl = (entry_price - exit_price) * amount
+                                net_pnl = None
+                                if known_leg_pnl is not None and entry_fee is not None:
+                                    # Комиссию за выход оцениваем той же
+                                    # ставкой, что и за вход — тот же приём,
+                                    # что и в trade_executor._finalize_close.
+                                    net_pnl = known_leg_pnl - entry_fee * 2
+                                trade_ledger.record_trade({
+                                    "event": "close",  # см. trade_ledger.daily_stats
+                                    "coin": coin_upper,
+                                    "long_exchange": pos.get("long_exchange"),
+                                    "short_exchange": pos.get("short_exchange"),
+                                    "long_entry_price": pos.get("long_entry_price"),
+                                    "short_entry_price": pos.get("short_entry_price"),
+                                    "long_exit_price": exit_price if other_side == "long" else None,
+                                    "short_exit_price": exit_price if other_side == "short" else None,
+                                    "amount_usdt": pos.get("amount_usdt"),
+                                    "gross_pnl": known_leg_pnl,
+                                    "net_pnl": net_pnl,
+                                    "close_reason": (
+                                        f"reconcile: пропавшая нога на {ex} — закрыл "
+                                        f"оставшуюся на {other_ex}"
+                                    ),
+                                    "opened_at": pos.get("opened_at"),
+                                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                                    "partial_data": True,
+                                    "partial_data_note": (
+                                        f"судьба ноги на {ex} неизвестна — уже отсутствовала "
+                                        f"на бирже к моменту этой проверки (вероятно закрыта "
+                                        f"отдельным событием reconcile ранее); PnL посчитан "
+                                        f"только по известной ноге на {other_ex}."
+                                    ),
+                                })
+                            except Exception as exc:
+                                print(f"[reconcile] {coin_upper}: не удалось записать в trade_ledger: {exc}")
                     except Exception as exc:
                         fail_msg = (
                             f"НЕ УДАЛОСЬ закрыть оставшуюся ногу {coin_upper} на {other_ex}: "
@@ -774,9 +1234,12 @@ class FundingScanner:
         # защита реально работает, а не просто "тихо всё хорошо" (что
         # неотличимо от "тихо сломалась"). Не через notifier — не хотим
         # спамить в Telegram каждую минуту, только когда РЕАЛЬНО что-то нашли.
+        # Источник данных пишем явно: иначе по логу невозможно отличить
+        # "поток работает и экономит REST" от "поток молча отвалился, и мы
+        # незаметно вернулись на REST" — а это разные состояния системы.
         print(
-            f"[reconcile] проверено бирж: {checked_exchanges}, найдено неучтённых позиций: "
-            f"{orphans_found}, найдено пропавших ног: {missing_found}."
+            f"[reconcile] проверено бирж: {checked_exchanges} (из них по потоку: {from_stream}), "
+            f"найдено неучтённых позиций: {orphans_found}, найдено пропавших ног: {missing_found}."
         )
 
     # -------------------------------------------------------------------
@@ -879,6 +1342,37 @@ class FundingScanner:
 
             tickers = await exchange.fetch_tickers(symbols)
 
+            # BULK bid/ask ПОДСТРАХОВКА (добавлено 2026-09-11, корень
+            # проблемы найден по трём реальным случаям подряд — FUTU, 0G,
+            # RAVE, все на aster): fetch_tickers у aster не отдаёт bid/ask
+            # вообще (см. комментарий ниже, 2026-09-07), поэтому цена
+            # берётся из ticker['last'] — а на негромких контрактах это
+            # цена ПОСЛЕДНЕЙ СДЕЛКИ, которая могла пройти давно и совсем не
+            # по рыночной цене (реально проверено: aster last по 0G был
+            # 0.1868 при живом рынке ~0.181, по RAVE — 0.2094 при ~0.203,
+            # по FUTU — 118.5 при ~113.5). early-spread-check перед входом
+            # эти фантомные спреды и так ловил (деньги не тратились), но
+            # монета попадала в "найдена связка" и тратила время сканера
+            # впустую на биржах с этим ограничением. У aster (в отличие от
+            # fetch_tickers) есть ОТДЕЛЬНЫЙ bulk-эндпоинт fetch_bids_asks,
+            # который живые bid/ask ДАЁТ (проверено напрямую: для тех же
+            # трёх монет отдал реальные ~0.1811/0.1814, ~0.2030/0.2034,
+            # 111.18/115.73 — совпадает с fetch_order_book). Используем его
+            # как источник цены НА БИРЖАХ, где сам fetch_tickers bid/ask не
+            # даёт — с приоритетом НАД last (last для таких бирж заведомо
+            # ненадёжен), а не просто как fallback при отсутствии last.
+            # Лишний bulk-запрос делаем ТОЛЬКО если это реально нужно — если
+            # fetch_tickers этой биржи и так отдаёт bid/ask хотя бы по части
+            # контрактов (обычная ситуация — gate/mexc/bybit/kucoin/
+            # binance/bitget/hyperliquid), fetch_bids_asks не нужен вообще.
+            tickers_have_bidask = any(t.get("bid") or t.get("ask") for t in tickers.values())
+            bids_asks_by_symbol: dict[str, dict] = {}
+            if not tickers_have_bidask and exchange.has.get("fetchBidsAsks"):
+                try:
+                    bids_asks_by_symbol = await exchange.fetch_bids_asks(symbols)
+                except Exception as exc:
+                    print(f"[scanner] {exchange_id}: fetch_bids_asks не сработал ({exc}), использую только last-цену тикеров.")
+
             funding_by_symbol: dict[str, dict] = {}
             if exchange.has.get("fetchFundingRates"):
                 try:
@@ -906,10 +1400,20 @@ class FundingScanner:
                 # bid/ask=None просто передаётся дальше как None (используется
                 # ниже в crossable-спред фильтре, который сам умеет мягко
                 # пропускать проверку при отсутствии данных — см. _evaluate_pair).
+                used_bidask_fallback = False
+                if not bid and not ask and symbol in bids_asks_by_symbol:
+                    ba = bids_asks_by_symbol[symbol]
+                    bid, ask = ba.get("bid"), ba.get("ask")
+                    used_bidask_fallback = bool(bid and ask)
                 if not bid and not ask and not ticker.get("last"):
                     continue  # действительно нет вообще никакой цены
 
-                price = self._extract_price(ticker, bid, ask)
+                # prefer_bidask=True ТОЛЬКО когда bid/ask реально пришли из
+                # bids_asks_by_symbol (см. выше) — для таких бирж мы уже
+                # знаем, что their ticker['last'] ненадёжен (устаревшая
+                # цена последней редкой сделки), поэтому здесь СОЗНАТЕЛЬНО
+                # доверяем живому bid/ask больше, чем last.
+                price = self._extract_price(ticker, bid, ask, prefer_bidask=used_bidask_fallback)
                 if not price:
                     continue
 
@@ -944,16 +1448,22 @@ class FundingScanner:
             return {}
 
     @staticmethod
-    def _extract_price(ticker: dict, bid=None, ask=None):
-        """ЕДИНАЯ референсная цена биржи, используется и при поиске связок
-        (_fetch_exchange_data), и при мониторинге текущего спреда открытых
-        позиций тестовой серии (_monitor_test_batch) — важно, чтобы это
-        было ОДНО и то же вычисление в обоих местах, иначе "текущий спред"
-        считался бы не той же линейкой, что "входной спред". 'last' (цена
-        последней сделки) — как и показывает сам канал сигналов ("Long
-        BITGET: $0.026120000" — тоже одно число на биржу, не bid/ask по
-        отдельности). Если 'last' не пришёл — подстраховываемся серединой
-        bid/ask (если они переданы)."""
+    def _extract_price(ticker: dict, bid=None, ask=None, prefer_bidask: bool = False):
+        """ЕДИНАЯ референсная цена биржи, используется при поиске связок
+        (_fetch_exchange_data). 'last' (цена последней сделки) — как и
+        показывает сам канал сигналов ("Long BITGET: $0.026120000" — тоже
+        одно число на биржу, не bid/ask по отдельности). Если 'last' не
+        пришёл — подстраховываемся серединой bid/ask (если они переданы).
+
+        prefer_bidask=True (добавлено 2026-09-11, см. _fetch_exchange_data)
+        — переворачивает приоритет: используется ТОЛЬКО когда переданные
+        bid/ask пришли из отдельного bulk-запроса fetch_bids_asks на бирже,
+        чей fetch_tickers bid/ask вообще не отдаёт (сейчас — aster). Для
+        таких бирж ticker['last'] на негромких контрактах доказанно
+        ненадёжен (реальные случаи: FUTU/0G/RAVE — last расходился с живым
+        рынком на 2-4%), а bid/ask из fetch_bids_asks — живой и точный."""
+        if prefer_bidask and bid and ask:
+            return (bid + ask) / 2
         price = ticker.get("last")
         if price:
             return price
@@ -1258,25 +1768,33 @@ class FundingScanner:
             f"| Spread: {opp['spread_pct']:.2f}% | Объём: ${amount_usdt:.2f} "
             f"(LONG {opp['long_exchange']} / SHORT {opp['short_exchange']})"
         )
+        # Отмечаем СТАРТ попытки открытия ДО отправки ордеров — см.
+        # _in_open_grace_period/_recent_open_attempts в __init__ (реальный
+        # случай STORJ) — reconcile должен знать, что эта монета сейчас,
+        # возможно, легитимно открывается, и не спутать её с орфаном.
+        self._recent_open_attempts[opp["coin"].upper()] = time.monotonic()
 
-        # execute_arbitrage_trade() внутри вызывает asyncio.run() (через
-        # TradeExecutionTool.open_spread) — это ЗАПРЕЩЕНО вызывать напрямую
-        # из корутины, которая уже выполняется внутри работающего event loop
-        # (а мы именно там — см. run() этого класса). Решение то же, что и
-        # в main.py:listen() handler — выполнить в отдельном потоке через
-        # run_in_executor.
-        loop = asyncio.get_running_loop()
+        # ПРЯМОЙ await (без run_in_executor) — обновлено 2026-09-11 по
+        # прямой просьбе пользователя ("как ускорить открытие ног"). Раньше
+        # здесь execute_arbitrage_trade() (внутри — asyncio.run()/
+        # run_coroutine_threadsafe через TradeExecutionTool.open_spread)
+        # выполнялась в отдельном потоке через run_in_executor, потому что
+        # её нельзя было звать напрямую из корутины, уже работающей внутри
+        # event loop бота (а мы именно там — см. run() этого класса).
+        # execute_arbitrage_trade_async() await'ит _open_both_legs_async()
+        # НАПРЯМУЮ на этом же loop — экономит создание потока и лишнее
+        # переключение контекста между вызовом и реальной отправкой
+        # ордеров (тот же приём, что уже применён к закрытию, см.
+        # close_structured_signal_detailed_async).
         try:
-            report = await loop.run_in_executor(
-                None,
-                trade_executor.execute_arbitrage_trade,
+            report = await trade_executor.execute_arbitrage_trade_async(
                 opp["coin"], opp["long_exchange"], opp["short_exchange"],
                 amount_usdt, opp["spread_pct"], self.notifier,
             )
         except Exception as exc:
             # Непредвиденное исключение (не штатный ERROR-статус ноги,
-            # который уже обработан внутри execute_arbitrage_trade) — тоже
-            # логируем и уведомляем, а не теряем молча.
+            # который уже обработан внутри execute_arbitrage_trade_async) —
+            # тоже логируем и уведомляем, а не теряем молча.
             print(f"[scanner][AUTO-TRADE] КРИТИЧЕСКАЯ ОШИБКА исполнения {opp['coin']}: {exc}")
             try:
                 self.notifier.notify_error(
@@ -1303,6 +1821,15 @@ class FundingScanner:
         доходим, новые связки не ищутся)."""
         if not self.test_batch.can_open_more():
             return  # серия уже набрана — ждём переключения состояния на следующем цикле
+
+        # СИСТЕМНЫЕ ЧАСЫ (см. _clock_guard_loop / clock_guard.py): при
+        # расхождении с биржами вход бессмыслен — подписи не пройдут, — но
+        # главное, он ОПАСЕН: если одна биржа примет запрос с чуть более
+        # широким окном, а вторая нет, останется голая нога, которую бот
+        # потом не сможет закрыть по той же причине. Тихий return —
+        # громкий алерт уже отправлен из _clock_guard_loop.
+        if not self._clock_ok:
+            return
 
         # АВТОМАТИЧЕСКАЯ БЛОКИРОВКА (см. blocked_coins_store.py) — по явной
         # просьбе пользователя 2026-09-09: после нескольких РЕАЛЬНЫХ откатов
@@ -1430,6 +1957,17 @@ class FundingScanner:
             book_tool._get_book_snapshot(opp["long_exchange"], opp["coin"], self.test_batch.amount_usdt),
             book_tool._get_book_snapshot(opp["short_exchange"], opp["coin"], self.test_batch.amount_usdt),
         )
+        # ПЕРЕДАЁМ СНИМКИ ДАЛЬШЕ (добавлено 2026-09-14): ровно эти же стаканы
+        # нужны потом внутри _open_both_legs_async (направление входа +
+        # финальная проверка спреда), и раньше они там запрашивались ЗАНОВО —
+        # лишние ~560мс (медиана по [timing]) на каждый вход. Между этими
+        # двумя точками обычно проходят миллисекунды (проверка схождения
+        # чаще всего берётся из кэша), поэтому повторный запрос ничего не
+        # уточнял. Возраст снимка проверяется на той стороне: если он вдруг
+        # успел устареть (сработала НЕкэшированная проверка схождения — это
+        # реальные секунды на запрос свечей), стаканы там перезапросятся.
+        opp["_book_snapshots"] = (long_snapshot, short_snapshot)
+        opp["_book_snapshots_at"] = time.monotonic()
         if long_snapshot is not None and short_snapshot is not None:
             long_vwap = long_snapshot.get("buy_vwap") or long_snapshot.get("reference_price")
             short_vwap = short_snapshot.get("sell_vwap") or short_snapshot.get("reference_price")
@@ -1458,47 +1996,36 @@ class FundingScanner:
         converged_recently, min_spread_seen = await self._check_spread_has_converged_recently(
             opp["coin"], opp["long_exchange"], opp["short_exchange"]
         )
-        if not converged_recently:
-            return
-
-        # ТОЛЬКО ШИРОКИЙ ВХОД ДЛЯ "НЕТУГИХ" МОНЕТ (добавлено 2026-09-08 по
-        # явной просьбе пользователя после реального случая с FONE:
-        # "если монета по истории вообще не доходит до спреда менее чем
-        # 1%, то лучше не открывать, если самого спреда при открытии не
-        # будет 15-20[%]") — монета может пройти проверку выше (сходилась
-        # НЕДАВНО до SCANNER_CONVERGENCE_MAX_SPREAD_PCT, обычно 2%), но
-        # если она НИКОГДА не сжималась туже жёсткого порога в 1% —
-        # это, похоже, коин с изначально широким "родным" разрывом
-        # котировок между биржами (как BP/FONE), где обычная сделка на
-        # 3% рискует превратиться в очень долгую и вероятно убыточную
-        # позицию. Для таких монет входим ТОЛЬКО если сам спред входа
-        # заведомо большой (15%+) — тогда даже частичное схождение даёт
-        # реальную прибыль, а не многочасовое/суточное ожидание.
-        tight_threshold = _get_float_env("SCANNER_TIGHT_CONVERGENCE_PCT", 1.0)
-        # ПРИНУДИТЕЛЬНО широкий вход для КОНКРЕТНЫХ монет (добавлено
-        # 2026-09-09 по явной просьбе пользователя: "не открывай FONE, ну
-        # можно если там будет 15% спреда") — в отличие от общего правила
-        # выше (которое смотрит на min_spread_seen и может не сработать,
-        # если монета формально ХОТЬ РАЗ показала узкий спред в окне —
-        # реальный случай: именно так FONE прошла все фильтры и открылась
-        # снова), для монет из этого списка требование 15%+ действует
-        # ВСЕГДА, независимо от результата convergence-check.
-        force_wide_coins = {
-            c.upper() for c in _get_list_env("SCANNER_FORCE_WIDE_SPREAD_COINS", "")
-        }
-        force_wide = opp["coin"].upper() in force_wide_coins
-        if force_wide or (min_spread_seen is not None and min_spread_seen > tight_threshold):
-            wide_entry_min = _get_float_env("SCANNER_WIDE_SPREAD_MIN_ENTRY_PCT", 15.0)
-            if opp["spread_pct"] < wide_entry_min:
-                reason = "монета в списке принудительно широкого входа" if force_wide else (
-                    f"история НИ РАЗУ не показала схождение туже {tight_threshold}% "
-                    f"(минимум был {min_spread_seen:.2f}%)"
-                )
-                print(
-                    f"[wide-spread-check] {opp['coin'].upper()}: {reason} — для таких монет нужен спред "
-                    f"входа минимум {wide_entry_min}%, а не {opp['spread_pct']:.2f}%. Пропускаю."
-                )
+        # ШИРОКИЙ ВХОД БЕЗ ИСТОРИИ СХОЖДЕНИЯ (добавлено 2026-09-11 по явной
+        # просьбе пользователя после реального случая STORJ: спред
+        # gate/bybit ни разу не опускался ниже 1% за 12ч, но сам спред
+        # входа — 3%+ — РЕАЛЬНЫЙ, не фантомный тикер (прошёл early-spread-
+        # check по стакану). Раньше такую монету просто пропускали
+        # целиком — теперь входим, но ТОЛЬКО если разрешено
+        # (SCANNER_ALLOW_WIDE_SPREAD_ENTRY) и помечаем позицию как
+        # "wide_spread": для неё в _monitor_test_batch действует
+        # ДОПОЛНИТЕЛЬНАЯ защита — максимальное время удержания и
+        # стоп-лосс (см. SCANNER_WIDE_SPREAD_MAX_HOLD_HOURS/
+        # SCANNER_WIDE_SPREAD_STOP_LOSS_USDT), которой нет у обычных,
+        # исторически сходящихся монет — история уже сказала нам, что
+        # схождения до 0.2-1% можно не дождаться вообще, поэтому нельзя
+        # просто ждать спред бесконечно, как для обычной связки.
+        opp["wide_spread"] = not converged_recently
+        opp["convergence_min_spread_seen_pct"] = min_spread_seen
+        if opp["wide_spread"]:
+            if not _get_bool_env("SCANNER_ALLOW_WIDE_SPREAD_ENTRY", True):
                 return
+            # min_spread_seen тут ВСЕГДА реальное число (не None) — если бы
+            # истории не было вовсе, _check_spread_has_converged_recently
+            # вернула бы (True, None), т.е. wide_spread было бы False.
+            print(
+                f"[wide-spread-entry] {opp['coin'].upper()}: история НЕ показала схождение "
+                f"туже {_get_float_env('SCANNER_CONVERGENCE_MAX_SPREAD_PCT', 1.0)}% за "
+                f"последние {_get_int_env('SCANNER_CONVERGENCE_LOOKBACK_HOURS', 12)}ч "
+                f"(минимум был {min_spread_seen:.2f}%) — вхожу всё равно (спред "
+                f"{opp['spread_pct']:.2f}% реальный); закроется при чистой прибыли > "
+                f"${_get_float_env('SCANNER_CLOSE_MIN_PROFIT_USDT', 0.10):.2f} (в минус не закрываемся, лимита времени нет)."
+            )
 
         await self._trigger_test_batch_trade(opp)
 
@@ -1630,20 +2157,32 @@ class FundingScanner:
             print(f"[test_batch] Не удалось отправить уведомление о старте сделки: {exc}")
 
         print(
-            f"[test_batch] Открываю тестовую сделку {next_number}/{self.test_batch.size}: "
+            f"[test_batch] Открываю сделку "
+            f"{f'#{next_number} (непрерывный режим)' if self.test_batch.unlimited else f'{next_number}/{self.test_batch.size}'}: "
             f"#{opp['coin']} | Spread: {opp['spread_pct']:.2f}% | Объём: ${amount_usdt:.2f} "
             f"(LONG {opp['long_exchange']} / SHORT {opp['short_exchange']})"
         )
+        # Отмечаем СТАРТ попытки открытия ДО отправки ордеров — см.
+        # _in_open_grace_period/_recent_open_attempts в __init__ (реальный
+        # случай STORJ, 4 ложных закрытия подряд реконсиляцией).
+        self._recent_open_attempts[opp["coin"].upper()] = time.monotonic()
 
-        # См. комментарий в _trigger_trade — то же самое: execute_arbitrage_trade
-        # блокирующий (asyncio.run() внутри), выполняем в отдельном потоке.
-        loop = asyncio.get_running_loop()
+        # См. комментарий в _trigger_trade — тот же прямой await напрямую
+        # на loop бота, без run_in_executor (обновлено 2026-09-11).
+        # extra_position_fields={"wide_spread": ...} (добавлено 2026-09-12,
+        # реальный случай ANTHROPIC) — без этого пометка "широкая монета"
+        # (правило закрытия 2%-тейк-профит без лимита времени/спреда)
+        # хранилась ТОЛЬКО в памяти и терялась при любом рестарте бота —
+        # позиция тихо переключалась на обычные правила закрытия.
         try:
-            report = await loop.run_in_executor(
-                None,
-                trade_executor.execute_arbitrage_trade,
+            report = await trade_executor.execute_arbitrage_trade_async(
                 opp["coin"], opp["long_exchange"], opp["short_exchange"],
                 amount_usdt, opp["spread_pct"], self.notifier,
+                extra_position_fields={"wide_spread": bool(opp.get("wide_spread"))},
+                # Готовые стаканы из early-spread-check (см. там же) — чтобы
+                # не запрашивать их второй раз. Возраст проверяется внутри.
+                prefetched_books=opp.get("_book_snapshots"),
+                prefetched_books_at=opp.get("_book_snapshots_at"),
             )
         except Exception as exc:
             print(f"[test_batch] КРИТИЧЕСКАЯ ОШИБКА открытия {opp['coin']}: {exc}")
@@ -1686,8 +2225,15 @@ class FundingScanner:
             short_entry_price=stored_position.get("short_entry_price"),
             amount_usdt=stored_position.get("amount_usdt") or amount_usdt,
             entry_fee_total=entry_fee_total,
+            wide_spread=bool(opp.get("wide_spread")),
         )
-        print(f"[test_batch] Серия: {self.test_batch.opened_count}/{self.test_batch.size} открыто.")
+        if self.test_batch.unlimited:
+            print(
+                f"[test_batch] Всего открыто сделок: {self.test_batch.opened_count} "
+                f"(сейчас в работе: {len(self.test_batch.open_positions)})."
+            )
+        else:
+            print(f"[test_batch] Серия: {self.test_batch.opened_count}/{self.test_batch.size} открыто.")
         if self.test_batch.state == test_batch_mod.MONITORING:
             print(
                 f"[test_batch] Серия заполнена ({self.test_batch.size}/{self.test_batch.size}) — "
@@ -1700,6 +2246,73 @@ class FundingScanner:
     # позиций серии ОДНОВРЕМЕННО (asyncio.gather, без последовательных
     # задержек) проверяет текущий спред и закрывает те, что достигли цели.
     # -------------------------------------------------------------------
+    async def _warm_leverage_for_candidates(self, opportunities: list) -> None:
+        """Заранее выставляет плечо на биржах для монет, в которые мы РЕАЛЬНО
+        можем зайти в ближайшее время — чтобы вход не платил за set_leverage
+        0.5-1.9с (замер 2026-09-14: aster 1875мс, gate 1172, bitget 610,
+        mexc 609, binance 594, bybit 500).
+
+        Осторожность здесь важнее скорости, поэтому:
+          * берём ТОЛЬКО связки, прошедшие порог входа по спреду и
+            состоящие из разрешённых бирж — греть тысячи рынков "на всякий
+            случай" бессмысленно и упрёмся в rate limit;
+          * ограничиваем число пар за цикл (LEVERAGE_WARM_MAX_PER_CYCLE);
+          * сторона (long/short) берётся из самой связки — у MEXC параметр
+            positionType зависит от стороны, прогрев "не той" стороны был бы
+            бесполезен;
+          * всё это в отдельной задаче, результат никто не ждёт, ошибки
+            гасятся внутри warm_leverage.
+        """
+        if not opportunities or self.test_batch is None:
+            return
+        limit = _get_int_env("LEVERAGE_WARM_MAX_PER_CYCLE", 6)
+        leverage = _get_int_env("TRADE_LEVERAGE", 5)
+        tool = TradeExecutionTool()
+        done = 0
+        seen = set()
+        for opp in opportunities:
+            if done >= limit:
+                break
+            if opp.get("spread_pct", 0) < self.test_batch.min_spread_pct:
+                continue
+            coin = opp.get("coin")
+            for exchange_name, side in ((opp.get("long_exchange"), "long"), (opp.get("short_exchange"), "short")):
+                if not exchange_name or exchange_name.lower() not in self.test_batch_safe_exchanges:
+                    continue
+                key = (exchange_name.lower(), coin, side)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if await tool.warm_leverage(exchange_name, coin, side, leverage):
+                    done += 1
+                    print(f"[leverage-warm] {exchange_name}/{coin} {side}: плечо {leverage}x выставлено заранее.")
+                if done >= limit:
+                    break
+
+    async def _sync_book_streams(self) -> None:
+        """Держит набор потоковых подписок в точности равным набору ног
+        ОТКРЫТЫХ позиций серии: новая позиция — подписались, закрылась —
+        отписались. Вызывается из цикла мониторинга (дёшево: сравнение
+        двух множеств, реальные действия только при изменениях).
+
+        Публичный стакан не требует ключей, поэтому клиенту потока хватает
+        минимального конфига — ключи сюда СОЗНАТЕЛЬНО не передаются."""
+        if not self.test_batch:
+            return
+        want = set()
+        for pos in self.test_batch.open_positions.values():
+            want.add((EXCHANGE_ALIASES.get(pos.long_exchange.lower(), pos.long_exchange.lower()), pos.long_symbol))
+            want.add((EXCHANGE_ALIASES.get(pos.short_exchange.lower(), pos.short_exchange.lower()), pos.short_symbol))
+        have = set()
+        for item in book_stream.active_streams():
+            ex_id, _, sym = item.partition("/")
+            have.add((ex_id, sym))
+        config = {"enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": 15000}
+        for ex_id, sym in want - have:
+            await book_stream.subscribe(ex_id, sym, config)
+        for ex_id, sym in have - want:
+            await book_stream.unsubscribe(ex_id, sym)
+
     async def _monitor_test_batch(self) -> None:
         positions = list(self.test_batch.open_positions.values())
         if not positions:
@@ -1720,11 +2333,22 @@ class FundingScanner:
             short_client = await self._get_client(position.short_exchange)
             if long_client is None or short_client is None:
                 return None
+            # СНАЧАЛА пробуем потоковый стакан (WebSocket, см. book_stream.py):
+            # он лежит в памяти и читается мгновенно, вместо ~560мс REST-запроса
+            # на КАЖДЫЙ цикл мониторинга. Если потока нет или он молчит —
+            # честно идём по REST, как раньше (fail-open, торговая логика
+            # от этого не зависит).
+            long_ex_id = EXCHANGE_ALIASES.get(position.long_exchange.lower(), position.long_exchange.lower())
+            short_ex_id = EXCHANGE_ALIASES.get(position.short_exchange.lower(), position.short_exchange.lower())
+            long_book = book_stream.get_book(long_ex_id, position.long_symbol)
+            short_book = book_stream.get_book(short_ex_id, position.short_symbol)
             try:
-                long_book, short_book = await asyncio.gather(
-                    long_client.fetch_order_book(position.long_symbol, limit=50),
-                    short_client.fetch_order_book(position.short_symbol, limit=50),
-                )
+                if long_book is None or short_book is None:
+                    fetched = await asyncio.gather(
+                        long_client.fetch_order_book(position.long_symbol, limit=50) if long_book is None else _already(long_book),
+                        short_client.fetch_order_book(position.short_symbol, limit=50) if short_book is None else _already(short_book),
+                    )
+                    long_book, short_book = fetched
             except Exception as exc:
                 print(f"[test_batch] {position.coin}: не удалось получить стакан ({type(exc).__name__}: {exc})")
                 return None
@@ -1733,18 +2357,6 @@ class FundingScanner:
             short_bids, short_asks = short_book.get("bids"), short_book.get("asks")
             if not long_bids or not long_asks or not short_bids or not short_asks:
                 return None
-
-            # ВАЖНО: направление ФИКСИРОВАНО с момента входа (это именно
-            # ТА биржа, где у нас LONG, и ТА, где SHORT). Референсная цена
-            # для СПРЕДА — середина стакана (bid+ask)/2, нормализуем
-            # USDC->USDT (см. _to_usdt_sync) ТОЛЬКО для спреда; для PnL
-            # ниже — реальная исполнимая цена закрытия, в локальной валюте
-            # каждой биржи (как entry_price при открытии).
-            long_mid = (long_bids[0][0] + long_asks[0][0]) / 2
-            short_mid = (short_bids[0][0] + short_asks[0][0]) / 2
-            long_mid_norm = _to_usdt_sync(long_mid, position.long_exchange)
-            short_mid_norm = _to_usdt_sync(short_mid, position.short_exchange)
-            current_spread = (short_mid_norm - long_mid_norm) / long_mid_norm * 100
 
             # ДЕЛЬТА-НЕЙТРАЛЬНАЯ МАТЕМАТИКА (по вашему уточнению 2026-09-06):
             # рынок может пойти в любую сторону — одна нога будет в плюсе,
@@ -1766,15 +2378,64 @@ class FundingScanner:
             if not long_exit_price or not short_exit_price:
                 return None
 
+            # СПРЕД СЧИТАЕМ ПО ЦЕНАМ ИСПОЛНЕНИЯ, А НЕ ПО СЕРЕДИНЕ СТАКАНА
+            # (исправлено 2026-09-13 по разбору ночной статистики). РАНЬШЕ
+            # здесь бралась середина книги (bid+ask)/2 на каждой бирже — и
+            # это СИСТЕМАТИЧЕСКИ врало в нашу невыгоду: закрываясь, мы
+            # ПЕРЕСЕКАЕМ обе книги (длинную ногу продаём по bid, короткую
+            # откупаем по ask), поэтому реально исполнимый спред всегда
+            # ШИРЕ среднего — на сумму полуспредов обеих бирж.
+            #
+            # Замер по 11 реальным сделкам за ночь 13.09: расхождение между
+            # спредом, который видел монитор, и спредом по ФАКТИЧЕСКИМ ценам
+            # исполнения — в среднем +1.01 процентного пункта, в 9 случаях
+            # из 11 в худшую сторону (до +2.87пп на ZCAT). Из-за этого
+            # триггер "спред сошёлся до close_spread_max_pct" срабатывал
+            # РАНО: монитор видел 1%, а исполниться можно было только по 2%,
+            # и мы фиксировали ~0.2% схождения при комиссиях, требующих
+            # 0.24% только для выхода в ноль — отсюда 5 из 6 ночных убытков
+            # с ПОЛОЖИТЕЛЬНЫМ gross и отрицательным net.
+            #
+            # Теперь спред считается ровно по тем ценам, по которым мы
+            # реально закроемся — "спред 1%" означает настоящий 1%.
+            long_exit_norm = _to_usdt_sync(long_exit_price, position.long_exchange)
+            short_exit_norm = _to_usdt_sync(short_exit_price, position.short_exchange)
+            current_spread = (short_exit_norm - long_exit_norm) / long_exit_norm * 100
+
             gross_pnl, net_pnl = self._estimate_total_pnl(position, long_exit_price, short_exit_price)
             if gross_pnl is None:
-                # Нет реальной цены входа (например, DRY_RUN) — оценить
-                # PnL нечем, полагаемся только на условие по спреду.
-                profitable = True
+                # Нет реальной цены входа (например, DRY_RUN) — оценить PnL
+                # нечем. ИСПРАВЛЕНО 2026-09-12 по явной просьбе пользователя
+                # ("нас интересует только +, не закрывай в минус") — раньше
+                # здесь стояло profitable=True (fail-open: закрывали по
+                # одному только спреду, без реального подтверждения
+                # прибыли) — единственная реальная дыра в правиле "не
+                # закрываем в минус": если по какой-то причине цену входа
+                # не удалось определить, эта ветка могла закрыть позицию
+                # БЕЗ проверки PnL вообще. Теперь fail-CLOSED: раз прибыль
+                # подтвердить нечем — не закрываем (кроме DRY_RUN, где
+                # реальных денег и так нет — там ждать нечего, спред
+                # достаточен).
+                dry_run = os.getenv("DRY_RUN", "True").lower() == "true"
+                profitable = dry_run
                 pnl_estimate = None
             else:
                 pnl_estimate = net_pnl if net_pnl is not None else gross_pnl
-                profitable = pnl_estimate > 0
+                # ЗАПАС ПРОЧНОСТИ (добавлено 2026-09-13 по прямой просьбе
+                # пользователя, реальный случай FONE: закрылась на VWAP-
+                # оценке +$0.0054 gross, но между решением и реальным
+                # исполнением цена сдвинулась на волосок, и после комиссий
+                # итог ушёл в -$0.0033) — раньше "прибыльно" означало
+                # ЛЮБОЕ положительное число, хоть +$0.0001, без запаса на
+                # микро-проскальзывание за секунды между решением и
+                # реальной отправкой ордеров закрытия. Теперь требуем
+                # положительный результат ЗАМЕТНО больше нуля — не только
+                # для min_profit_usdt-ветки ниже (у неё свой, более
+                # высокий порог), а для САМОГО факта "мы в плюсе" в
+                # принципе, включая путь "спред сошёлся до close_spread_
+                # max_pct".
+                close_profit_buffer = _get_float_env("SCANNER_CLOSE_PROFIT_BUFFER_USDT", 0.02)
+                profitable = pnl_estimate > close_profit_buffer
 
             return position, current_spread, profitable, pnl_estimate
 
@@ -1791,30 +2452,79 @@ class FundingScanner:
         # не дожидаясь схождения спреда до close_spread_max_pct.
         min_profit_usdt = _get_float_env("SCANNER_CLOSE_MIN_PROFIT_USDT", 0.15)
 
-        def _should_close(r) -> bool:
+        # ЗАЩИТА ДЛЯ "ШИРОКИХ" ПОЗИЦИЙ БЕЗ ИСТОРИИ СХОЖДЕНИЯ (добавлено
+        # 2026-09-11, см. подробный комментарий в
+        # _handle_test_batch_opportunity про opp["wide_spread"] и реальный
+        # случай STORJ) — такие позиции открыты, ЗАРАНЕЕ зная, что спред
+        # исторически мог вообще не сходиться до close_spread_max_pct.
+        # ПРАВИЛА (по явной просьбе пользователя, ОБНОВЛЕНО 2026-09-12):
+        # "не закрывай сделку в -... ждём только +пнл... нас интересует
+        # только +" — лимит времени, который раньше закрывал такую позицию
+        # ПРИНУДИТЕЛЬНО даже в убытке (единственная защита от бесконечного
+        # удержания, которую сам же пользователь просил раньше), ОТМЕНЁН
+        # по его явному подтверждению ("убрать лимит, ждать только +"),
+        # несмотря на озвученный риск — позиция теперь МОЖЕТ занимать
+        # маржу/слот на бирже сколь угодно долго, если прибыль так и не
+        # придёт. Единственное условие закрытия, ТОЛЬКО для
+        # position.wide_spread — тейк-профит В ПРОЦЕНТАХ от вложенной
+        # суммы (не в USDT — по просьбе "если мы уходим в 2% плюса ...
+        # это тоже прибыль для нас"), заметно выше общего
+        # SCANNER_CLOSE_MIN_PROFIT_USDT. Для обычных (не wide_spread)
+        # позиций поведение НЕ меняется.
+
+        def _should_close(r) -> "tuple[bool, str | None]":
+            """Возвращает (закрывать_ли, принудительная_причина). Причина
+            None означает обычное закрытие по достижении цели — вызывающий
+            код сам сформирует стандартный текст ('спред сошёлся до X%')."""
             if r is None:
-                return False
+                return False, None
             position, current_spread, profitable, pnl_estimate = r
+
+            if position.wide_spread:
+                # ОБНОВЛЕНО 2026-09-13 по прямой просьбе пользователя ("закрывай
+                # когда будет +0.10 с учётом комиссии и минусовой ноги"): для
+                # широких позиций та же планка, что и для всех остальных —
+                # чистый PnL обеих ног после комиссий > min_profit_usdt. Прежний
+                # отдельный тейк-профит в процентах (2% ~ $1.00 на $50) отменён
+                # — он заставлял бы держать позицию много дольше ради большего
+                # куша, пользователь предпочёл забирать стабильные +$0.10.
+                # Единственное отличие от обычных позиций сохраняется: путь
+                # "спред сошёлся до close_spread_max_pct" здесь не используется
+                # (у широкой монеты он по истории не сходится — иначе она не
+                # была бы широкой); в минус не закрываемся, лимита времени нет.
+                if pnl_estimate is not None and pnl_estimate > min_profit_usdt:
+                    return True, (
+                        f"широкий спред: чистая прибыль {pnl_estimate:+.4f} USDT "
+                        f"(обе ноги, после комиссий) превысила ${min_profit_usdt:.2f} — закрываю"
+                    )
+                return False, None
+
             if not profitable:
-                return False
+                return False, None
             if position.coin.upper() in self.breakeven_close_coins:
                 # См. self.breakeven_close_coins — не ждём схождения спреда,
                 # достаточно net_pnl >= 0.
-                return True
+                return True, None
             if pnl_estimate is not None and pnl_estimate >= min_profit_usdt:
                 # См. min_profit_usdt выше — заметная прибыль сама по себе
                 # достаточна, спред можно не ждать.
-                return True
-            return current_spread <= self.test_batch.close_spread_max_pct
+                return True, None
+            return current_spread <= self.test_batch.close_spread_max_pct, None
 
         # candidates уже посчитаны по VWAP (см. check_close_vwap выше) — то
         # есть это уже и есть "финальная проверка по стакану", отдельный
         # второй проход (_verify_close_still_profitable) больше не нужен,
         # см. комментарий у check_close_vwap. Закрываем ВСЕ достигшие цели
         # ОДНОВРЕМЕННО — без последовательных задержек между позициями.
-        candidates = [(r[0], r[1]) for r in results if _should_close(r)]
+        candidates = []
+        for r in results:
+            should_close, forced_reason = _should_close(r)
+            if should_close:
+                candidates.append((r[0], r[1], forced_reason))
         if candidates:
-            await asyncio.gather(*(self._close_test_batch_position(pos, spread) for pos, spread in candidates))
+            await asyncio.gather(
+                *(self._close_test_batch_position(pos, spread, reason=reason) for pos, spread, reason in candidates)
+            )
 
     async def _verify_close_still_profitable(self, position: "test_batch_mod.TestBatchPosition") -> bool:
         """СЕЙЧАС НЕ ИСПОЛЬЗУЕТСЯ (объединена с check_price в один
@@ -1993,7 +2703,9 @@ class FundingScanner:
             net_pnl = gross_pnl - position.entry_fee_total * 2
         return gross_pnl, net_pnl
 
-    async def _close_test_batch_position(self, position: "test_batch_mod.TestBatchPosition", current_spread: float) -> None:
+    async def _close_test_batch_position(
+        self, position: "test_batch_mod.TestBatchPosition", current_spread: float, reason: str = None
+    ) -> None:
         # ПРЯМОЙ await вместо run_in_executor (2026-09-10, по прямой
         # просьбе пользователя "нагружай максимально... сделай
         # параллельным, чтобы закрывались по нужной цене") — этот код и
@@ -2004,10 +2716,24 @@ class FundingScanner:
         # контекста между решением "закрываем" и реальной отправкой
         # ордеров на биржи. См. close_structured_signal_detailed_async
         # в trade_executor.py.
+        #
+        # reason (добавлено 2026-09-11) — позволяет вызывающему коду
+        # (_monitor_test_batch: _should_close) подставить свою причину
+        # закрытия вместо стандартной "спред сошёлся" — нужно для
+        # принудительных закрытий wide_spread-позиций (лимит времени/
+        # стоп-лосс), где реальная причина закрытия ДРУГАЯ (см. там же).
         try:
             result = await trade_executor.close_structured_signal_detailed_async(
                 position.coin, self.notifier,
-                f'спред сошёлся до {current_spread:.2f}% (тестовая серия)',
+                reason or f'спред сошёлся до {current_spread:.2f}% (тестовая серия)',
+                # ФИНАЛЬНАЯ проверка прибыли по живому стакану прямо перед
+                # отправкой ордеров (добавлено 2026-09-13, реальный случай
+                # STORJ: решение при спреде 0.99%, исполнение по факту при
+                # 3.28%) — тот же порог, что и у самого решения о закрытии,
+                # чтобы гейт не спорил сам с собой: раз PnL успел упасть
+                # ниже — просто ждём следующего цикла, а не фиксируем
+                # ухудшившийся результат.
+                min_net_pnl=_get_float_env("SCANNER_CLOSE_PROFIT_BUFFER_USDT", 0.02),
             )
         except Exception as exc:
             print(f"[test_batch] КРИТИЧЕСКАЯ ОШИБКА закрытия {position.coin}: {exc}")
@@ -2025,6 +2751,13 @@ class FundingScanner:
             # трекера серии без статистики, чтобы не зависла в мониторинге.
             print(f"[test_batch] {position.coin}: позиция не найдена в учёте — снимаю из серии без статистики.")
             self.test_batch.open_positions.pop(position.coin, None)
+            return
+
+        if result.get("close_aborted"):
+            # Закрытие ОТМЕНЕНО финальной проверкой прибыли по живому
+            # стакану (см. _verify_close_still_worth_it) — не ошибка, а
+            # штатное "ещё не время". Позиция остаётся в мониторинге,
+            # следующий цикл проверит заново. Лог уже напечатан внутри.
             return
 
         if not result["both_ok"]:
@@ -2059,7 +2792,14 @@ class FundingScanner:
                 pnl_amount=trade.pnl_amount,
                 pnl_percent=trade.pnl_percent,
                 closed_count=len(self.test_batch.closed_trades),
-                total_count=self.test_batch.size,
+                # В непрерывном режиме "всего" не существует — показываем
+                # то же число, что и закрыто, чтобы в алерте было "N / N",
+                # а не бессмысленное "N / 0".
+                total_count=(
+                    len(self.test_batch.closed_trades)
+                    if self.test_batch.unlimited
+                    else self.test_batch.size
+                ),
             )
         except Exception as exc:
             print(f"[test_batch] Не удалось отправить алерт закрытия {position.coin}: {exc}")
@@ -2069,7 +2809,11 @@ class FundingScanner:
             f"[test_batch] Закрыта #{position.coin}: PnL {pnl_amount:+.4f}$ ({pnl_percent:+.2f}%), "
             f"удержание {trade.holding_seconds:.0f}с"
             + (f", задержка между ногами закрытия {elapsed_ms:.0f}мс" if elapsed_ms is not None else "")
-            + f". Серия: {len(self.test_batch.closed_trades)}/{self.test_batch.size} закрыто."
+            + (
+                f". Всего закрыто: {len(self.test_batch.closed_trades)}."
+                if self.test_batch.unlimited
+                else f". Серия: {len(self.test_batch.closed_trades)}/{self.test_batch.size} закрыто."
+            )
         )
 
         if self.test_batch.state == test_batch_mod.DONE:

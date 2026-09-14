@@ -55,14 +55,15 @@ def is_permanent_error(reason: str) -> bool:
 
 
 def auto_exclude_coin(coin: str) -> bool:
-    """Добавляет монету в SCANNER_EXCLUDED_COINS — и в файл .env (переживает
-    рестарт), и сразу в os.environ текущего процесса (main.py читает список
-    динамически через os.getenv на каждый сигнал — там подействует
-    немедленно). scanner.py кэширует список в __init__, так что там
-    подействует только после рестарта — до этого момента монету всё равно
-    держит закрытой обычная блокировка is_blocked(), так что дыры нет.
-    Возвращает True, если монета была добавлена только что (раньше в
-    списке не было)."""
+    """УСТАРЕЛО (оставлено для обратной совместимости, не вызывается из
+    trade_tool.py начиная с 2026-09-11 — см. auto_exclude_coin_on_exchange
+    ниже): добавляет монету в SCANNER_EXCLUDED_COINS ЦЕЛИКОМ, на ВСЕХ
+    биржах. По прямой просьбе пользователя 2026-09-11 ("если появляется
+    contract not activated — исключай его на той бирже, где появилась
+    ошибка") глобальное исключение заменено на точечное — "contract not
+    activated" почти всегда означает проблему с КОНКРЕТНЫМ аккаунтом на
+    КОНКРЕТНОЙ бирже (контракт не включён именно там), а не с монетой как
+    таковой — на других биржах она вполне может нормально торговаться."""
     coin = coin.upper()
     try:
         with open(_ENV_PATH, "r", encoding="utf-8") as f:
@@ -91,6 +92,61 @@ def auto_exclude_coin(coin: str) -> bool:
     with open(_ENV_PATH, "w", encoding="utf-8") as f:
         f.writelines(lines)
     os.environ["SCANNER_EXCLUDED_COINS"] = coin
+    return True
+
+
+def auto_exclude_coin_on_exchange(coin: str, exchange: str) -> bool:
+    """Добавляет пару (МОНЕТА:биржа) в SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS
+    — и в файл .env (переживает рестарт), и сразу в os.environ текущего
+    процесса (main.py/skyspreads_signals.py читают эту переменную
+    динамически через is_coin_exchange_excluded() на каждый сигнал — там
+    подействует немедленно). scanner.py кэширует разобранный набор пар в
+    __init__ (self.excluded_coin_exchange_pairs), так что для НЕГО
+    подействует только после рестарта — до этого момента монету на этой
+    бирже всё равно продолжает ловить обычная блокировка is_blocked()
+    (см. record_rollback_failure/FAILURE_THRESHOLD), так что дыры нет.
+
+    По прямой просьбе пользователя 2026-09-11 ("исключай его на той
+    бирже, где появилась ошибка") — ТОЧЕЧНОЕ исключение вместо
+    auto_exclude_coin() (который банил монету на ВСЕХ биржах сразу):
+    "contract not activated" — это ограничение конкретного аккаунта на
+    конкретной бирже, монета вполне может нормально торговаться на
+    остальных семи. Возвращает True, если пара была добавлена только что
+    (раньше в списке не было)."""
+    coin = coin.upper()
+    exchange = (exchange or "").strip().lower()
+    if not exchange:
+        return False
+    try:
+        with open(_ENV_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+
+    pair_str = f"{coin}:{exchange}"
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS="):
+            _, _, value = stripped.partition("=")
+            existing = [p.strip() for p in value.split(",") if p.strip()]
+            existing_pairs = parse_coin_exchange_pairs(value)
+            if (coin, exchange) in existing_pairs:
+                os.environ["SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS"] = ",".join(existing)
+                return False
+            existing.append(pair_str)
+            new_value = ",".join(existing)
+            lines[i] = f"SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS={new_value}\n"
+            with open(_ENV_PATH, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            os.environ["SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS"] = new_value
+            return True
+
+    # Строки SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS= в .env не нашлось —
+    # дописываем в конец.
+    lines.append(f"\nSCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS={pair_str}\n")
+    with open(_ENV_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.environ["SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS"] = pair_str
     return True
 
 

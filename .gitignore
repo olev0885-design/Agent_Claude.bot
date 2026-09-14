@@ -61,3 +61,9 @@ blocked_coins.json
 
 # --- Персистентный журнал завершённых сделок (trade_ledger.py) ---------------
 trade_ledger.jsonl
+
+# --- Дата последней отправки ежедневного отчёта (scanner.py:_daily_report_loop) ---
+daily_report_state.json
+
+# --- Заметка для Telegram при рестарте (main.py читает и удаляет) — операционная, не в репозиторий ---
+restart_note.txt

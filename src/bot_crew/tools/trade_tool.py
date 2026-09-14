@@ -26,6 +26,11 @@ from pydantic import BaseModel, Field  # Для строгой схемы вхо
 # нескольких РЕАЛЬНЫХ откатов подряд (не путать с VWAP pre-check
 # отменами, те денег не тратят и здесь не учитываются).
 from bot_crew import blocked_coins_store
+# См. private_stream.py — приватные WebSocket-потоки (позиции/ордера).
+# Используется здесь ТОЛЬКО для мгновенного подтверждения исполнения
+# ордера (см. _verify_order_filled); при любом сбое потока путь
+# полностью откатывается на прежние REST-проверки.
+from bot_crew import private_stream
 
 
 # =============================================================================
@@ -178,7 +183,9 @@ def _extract_ticker_price(ticker: dict):
     return None
 
 
-async def _verify_order_filled(exchange, order: dict, symbol: str, exchange_id: str) -> dict:
+async def _verify_order_filled(
+    exchange, order: dict, symbol: str, exchange_id: str, exchange_name: str = None
+) -> dict:
     """Перепроверяет, что ордер РЕАЛЬНО исполнен биржей, а не просто создан
     без исключения. Два независимых реальных случая, оба проверены
     2026-09-06 на боевых demo-ордерах:
@@ -210,6 +217,46 @@ async def _verify_order_filled(exchange, order: dict, symbol: str, exchange_id: 
     verify_params = {"uta": False} if exchange_id == "bitget" else {}
     if exchange_id == "bybit":
         verify_params["acknowledged"] = True
+
+    # СНАЧАЛА — ПРИВАТНЫЙ ПОТОК (добавлено 2026-09-14, см. private_stream.py).
+    # Биржа сама пушит факт исполнения по WebSocket, обычно за 20-80мс,
+    # тогда как лестница ниже в лучшем случае узнаёт об этом через 200мс
+    # плюс round-trip REST-запроса. Для Bitget это особенно важно: она
+    # НИКОГДА не возвращает статус синхронно в ответе на создание (см.
+    # случай 1 в докстринге), то есть до сих пор платила полную цену
+    # лестницы на КАЖДОМ ордере.
+    #
+    # ПОЧЕМУ ЭТО НЕ МОЖЕТ ЗАМЕДЛИТЬ ВХОД: если поток не поднят или
+    # недоступен, wait_for_fill возвращает None МГНОВЕННО (проверка
+    # orders_ready внутри), и мы идём прежним путём без единой лишней
+    # миллисекунды. А если поток есть, но промолчал — потраченное время
+    # ВЫЧИТАЕТСЯ из первой паузы лестницы (waited ниже), поэтому суммарно
+    # ожидание не превышает прежнего. Ускорение не имеет права
+    # оборачиваться замедлением на пути реальных денег.
+    waited = 0.0
+    if status != "canceled" and order.get("id"):
+        stream_key = exchange_name or exchange_id
+        started = time.monotonic()
+        try:
+            streamed = await private_stream.wait_for_fill(stream_key, order.get("id"))
+        except Exception as exc:
+            # Поток — вспомогательный путь. Любой его сбой не должен
+            # мешать верификации: молча уходим на REST-лестницу.
+            print(f"[private-stream] {stream_key}: сбой ожидания исполнения ({type(exc).__name__}: {exc}).")
+            streamed = None
+        waited = time.monotonic() - started
+        if streamed is not None:
+            # Печатаем ЯВНО, каким путём получено подтверждение. Без этого
+            # по логу невозможно отличить "поток работает" от "поток тихо
+            # отвалился, и мы незаметно вернулись к лестнице" — а разница
+            # между ними больше секунды на каждой ноге. Тот же принцип, что
+            # и в строке [timing]: замер обязан сам говорить, откуда он.
+            print(
+                f"[private-stream] {stream_key}: исполнение ордера {order.get('id')} "
+                f"подтверждено ПОТОКОМ за {waited * 1000:.0f}мс (без REST-лестницы)."
+            )
+            return streamed
+
     # Быстрые паузы (0.2, 0.4, 0.6) сохранены по прямой просьбе
     # пользователя 2026-09-10 — после реального инцидента (LAB на MEXC,
     # -$2.57, см. историю) решили НЕ жертвовать скоростью исполнения, а
@@ -220,7 +267,13 @@ async def _verify_order_filled(exchange, order: dict, symbol: str, exchange_id: 
     for delay in (0.2, 0.4, 0.6):
         if status == "canceled":
             break
-        await asyncio.sleep(delay)
+        # Вычитаем время, уже потраченное на ожидание потока, ТОЛЬКО из
+        # первой ступени (waited обнуляется сразу после) — дальше лестница
+        # работает ровно как раньше.
+        sleep_for = max(0.0, delay - waited)
+        waited = 0.0
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
         try:
             order = await exchange.fetch_order(order.get("id"), symbol, params=verify_params)
         except Exception as exc:
@@ -234,6 +287,155 @@ async def _verify_order_filled(exchange, order: dict, symbol: str, exchange_id: 
         if status == "closed" or filled > 0:
             break
     return order
+
+
+# =============================================================================
+# КЭШ СТАВОК TAKER-КОМИССИИ (добавлено 2026-09-13 по прямой просьбе
+# пользователя: "сделать один запрос на комиссию, запомнить и обновлять
+# каждые 30 минут, а не запрашивать постоянно, повышая время выхода ноги").
+#
+# Что было (см. старую _get_taker_fee_rate): на КАЖДУЮ сделку — новый клиент
+# биржи без ключей + load_markets() (у gate это 6500+ рынков) ради ОДНОГО
+# поля market["taker"]. Реальные замеры по [timing] на закрытиях MTL/ZCAT:
+# 11 984мс, 12 219мс, 16 157мс — при том, что сами ордера исполнялись за
+# ~1.4с. То есть 90% времени "закрытия" уходило на справочный запрос,
+# который ещё и регулярно упирался в таймаут 15с и возвращал None (net_pnl
+# в журнале оставался пустым). И это ПОСЛЕ исполнения ордеров — окно, в
+# котором position_store уже устарел, и reconcile успевал дважды
+# "подтвердить" пропавшую ногу (реальный случай ZCAT 17:51 UTC).
+#
+# И второе: market["taker"] — это ПУБЛИЧНЫЙ базовый тариф из справочника
+# CCXT, а не то, что реально списывает биржа с нашего аккаунта. Сверка с
+# fetch_my_trades по реальным сделкам 2026-09-13: mexc 0.080% (в CCXT 0.020%
+# — в 4 раза меньше!), bybit 0.100% (0.060%), bitget 0.100% (0.060%); gate и
+# binance совпали (0.050%). Из-за этого net_pnl в журнале был завышен, а
+# решение "мы уже в плюсе" принималось по заниженным комиссиям — прямая
+# причина части "gross плюс / net минус" за ночь.
+#
+# Три источника ставки, по убыванию доверия:
+#   1) "fill"     — реальная комиссия из ответа биржи на ИСПОЛНЕННЫЙ ордер
+#                   (order["fee"]["cost"] / номинал). Ground truth, ноль
+#                   дополнительных запросов, обновляется каждой сделкой.
+#   2) "override" — явная ставка из EXCHANGE_TAKER_FEE_OVERRIDES в .env
+#                   (посеяно замеренными реальными значениями, см. выше) —
+#                   действует, пока по бирже нет ни одного своего исполнения.
+#   3) "static"   — market["taker"] из УЖЕ загруженных рынков персистентного
+#                   клиента (мгновенно, без нового клиента и load_markets),
+#                   кэшируется на FEE_RATE_CACHE_TTL_SECONDS (30 мин).
+# =============================================================================
+_FEE_RATE_CACHE: dict = {}
+_LEVERAGE_CONFIGURED: set = set()  # (exchange_id, symbol, leverage, side) — см. _place_single_order  # exchange_id -> {"rate": float, "ts": monotonic, "source": str}
+
+# MEXC требует явно указывать openType в КАЖДОМ вызове, где есть margin-
+# режим: и в set_leverage, и в самом create_order. 2 = cross (по явной
+# просьбе пользователя 2026-09-06 "вернуть кросс на всех биржах").
+#
+# Вынесено на уровень модуля 2026-09-14 после реального сбоя: при выносе
+# логики плеча в ensure_leverage_configured переменная осталась локальной
+# внутри нового метода, а create_order в _place_single_order продолжал на
+# неё ссылаться — нога на MEXC падала с NameError, вторая нога при этом
+# успевала открыться и её приходилось откатывать (поймано тестовой сделкой
+# MTL, реальная стоимость ошибки — комиссии за открытие и откат bybit).
+# Константа уровня модуля гарантирует, что режим плеча и режим ордера
+# физически не могут разойтись.
+MEXC_OPEN_TYPE_CROSS = 2  # 1 = isolated, 2 = cross
+
+# =============================================================================
+# КЭШ СВОБОДНОГО БАЛАНСА (добавлено 2026-09-14 по замеру задержки входа CAP).
+# Проверка маржи перед ордером (см. balance-guard в _open_both_legs_async)
+# запрашивала баланс по обеим ногам КАЖДЫЙ раз. Замер 2026-09-14: gate
+# 2015мс, aster 1812мс, bitget 1078мс, bybit 985мс, mexc 844мс, binance
+# 657мс — после того как стаканы стали переиспользоваться, именно это
+# осталось главным тормозом входа (781мс в [timing] по CAP).
+#
+# Баланс меняется предсказуемо: от НАШИХ же сделок (тогда сбрасываем кэш
+# явно, см. _invalidate_balance) и от фандинга (мелкие суммы раз в 8 часов).
+# Поэтому короткий TTL + сброс после каждого ордера дают точность, которой
+# с запасом хватает для гейта с его 10%-м буфером. Если кэш пуст/протух —
+# запрашиваем как раньше.
+# =============================================================================
+_BALANCE_CACHE: dict = {}  # exchange_id -> {"free": float, "ts": monotonic}
+
+
+def _balance_cache_ttl() -> float:
+    try:
+        return float(os.getenv("BALANCE_CACHE_TTL_SECONDS", "60"))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _invalidate_balance(exchange_name: str) -> None:
+    """Сбросить кэш баланса биржи — вызывается после КАЖДОГО реально
+    отправленного ордера (открытие/закрытие): маржа изменилась, старое
+    значение больше не годится."""
+    _BALANCE_CACHE.pop(EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower()), None)
+
+
+def _fee_cache_ttl_seconds() -> float:
+    try:
+        return float(os.getenv("FEE_RATE_CACHE_TTL_SECONDS", "1800"))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _fee_overrides() -> dict:
+    """EXCHANGE_TAKER_FEE_OVERRIDES="mexc:0.0008,bybit:0.001" -> {"mexc": 0.0008, ...}
+    (ключ — каноническое имя биржи как в SCANNER_EXCHANGES, приводится к
+    CCXT-id через EXCHANGE_ALIASES). Читается каждый раз (дёшево), чтобы
+    правка .env подхватывалась без рестарта."""
+    result = {}
+    raw = os.getenv("EXCHANGE_TAKER_FEE_OVERRIDES", "")
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        name, _, value = item.partition(":")
+        try:
+            rate = float(value)
+        except ValueError:
+            continue
+        ex_id = EXCHANGE_ALIASES.get(name.strip().lower(), name.strip().lower())
+        result[ex_id] = rate
+    return result
+
+
+def _learn_fee_from_fill(exchange_id: str, order: dict) -> None:
+    """Достаёт РЕАЛЬНУЮ ставку из исполненного ордера и запоминает её в
+    кэше как источник "fill" (высший приоритет). Никогда не бросает
+    исключений и ничего не запрашивает у биржи — только читает то, что
+    уже пришло в ответе. Если комиссии в ответе нет (часть бирж не отдаёт
+    её в create_order — но отдаёт в fetch_order, см. _resolve_fill_price,
+    который для этого сливает fee из повторного запроса обратно в order),
+    просто молча ничего не делает."""
+    try:
+        fee = order.get("fee") or {}
+        fee_cost = fee.get("cost")
+        if fee_cost is None:
+            fees = order.get("fees") or []
+            fee_cost = sum((f.get("cost") or 0) for f in fees) if fees else None
+        notional = order.get("cost")
+        if not notional:
+            filled = order.get("filled") or order.get("amount")
+            avg = order.get("average") or order.get("price")
+            if filled and avg:
+                notional = filled * avg
+        if not fee_cost or not notional or notional <= 0:
+            return
+        rate = abs(fee_cost) / notional
+        # Санити: taker-комиссия на фьючерсах — доли процента. Всё, что вне
+        # (0; 1%], — скорее всего комиссия в другой валюте/единицах или
+        # мусор в ответе; такое не учим.
+        if not (0 < rate <= 0.01):
+            return
+        prev = _FEE_RATE_CACHE.get(exchange_id)
+        if prev and prev.get("rate") and abs(rate - prev["rate"]) / prev["rate"] > 0.25:
+            print(
+                f"[fee] {exchange_id}: реальная ставка по исполнению {rate*100:.3f}% заметно "
+                f"отличается от прежней {prev['rate']*100:.3f}% ({prev.get('source')}) — обновляю."
+            )
+        _FEE_RATE_CACHE[exchange_id] = {"rate": rate, "ts": time.monotonic(), "source": "fill"}
+    except Exception:
+        pass  # обучение — вспомогательное, не должно мешать сделке
 
 
 async def _resolve_fill_price(exchange, order: dict, symbol: str, exchange_id: str) -> Optional[float]:
@@ -268,11 +470,20 @@ async def _resolve_fill_price(exchange, order: dict, symbol: str, exchange_id: s
         verify_params["acknowledged"] = True
     try:
         fresh = await exchange.fetch_order(order_id, symbol, params=verify_params)
+        # Сливаем в исходный order всё полезное из повторного запроса — в
+        # т.ч. fee/cost/filled, которых в ответе create_order часто нет, а
+        # для _learn_fee_from_fill они нужны (см. кэш ставок выше).
+        for key in ("fee", "fees", "cost", "filled", "average"):
+            if fresh.get(key) is not None and order.get(key) is None:
+                order[key] = fresh[key]
         price = fresh.get("average") or fresh.get("price")
         if price:
             return price
         await asyncio.sleep(0.2)
         fresh = await exchange.fetch_order(order_id, symbol, params=verify_params)
+        for key in ("fee", "fees", "cost", "filled", "average"):
+            if fresh.get(key) is not None and order.get(key) is None:
+                order[key] = fresh[key]
         return fresh.get("average") or fresh.get("price")
     except Exception as exc:
         print(f"[fill-price] Не удалось перезапросить точную цену исполнения ордера {order_id} ({exchange_id}): {exc}")
@@ -318,6 +529,36 @@ def _bump_amount_to_minimum(market: dict, order_amount: float, price, contract_s
             order_amount = (min_cost / (price * contract_size)) * 1.005
 
     return order_amount
+
+
+def _estimate_min_notional(market: dict, price, contract_size: float) -> "float | None":
+    """Сколько РЕАЛЬНО будет стоить (в валюте котировки) минимально
+    допустимый лот этого рынка. Та же арифметика, что и в
+    _bump_amount_to_minimum выше, но БЕЗ побочных эффектов — только
+    оценка, чтобы решить, стоит ли вообще заходить.
+
+    Добавлено 2026-09-13 по прямой просьбе пользователя после реального
+    случая ANTHROPIC: при цели $8 на ногу минимальный лот 0.01 шт при цене
+    ~$2100 дал позицию на ~$21 — В 2.6 РАЗА больше задуманного, т.е. мы не
+    контролировали собственный риск. Пользователь: "если мы не можем
+    открыть на 5 маржи и 5 плечо что-то, то можем просто понизить ставку —
+    вместо того чтобы повышать". Ниже минимального лота биржа физически не
+    пустит, поэтому "понизить" на практике = не брать такую монету вовсе и
+    оставить деньги на монеты, куда наш размер помещается нормально."""
+    if not price:
+        return None
+    limits = market.get("limits") or {}
+    min_amount = (limits.get("amount") or {}).get("min")
+    min_cost = (limits.get("cost") or {}).get("min")
+
+    candidates = []
+    if min_amount is not None:
+        candidates.append(min_amount * price * contract_size)
+    if min_cost is not None:
+        candidates.append(min_cost)
+    if not candidates:
+        return None
+    return max(candidates)
 
 
 # =============================================================================
@@ -548,7 +789,19 @@ class TradeExecutionTool(BaseTool):
     # _build_exchange_client — вспомогательная функция: создаёт объект
     # клиента CCXT для указанной биржи, подставляя API-ключи из .env.
     # -------------------------------------------------------------------
-    def _build_exchange_client(self, exchange_name: str):
+    def _build_exchange_client(self, exchange_name: str, ccxt_module=None):
+        """ccxt_module (добавлен 2026-09-14) — какой вариант CCXT
+        использовать для КЛАССА биржи. По умолчанию ccxt.async_support
+        (обычный REST-клиент бота). private_stream.py передаёт сюда
+        ccxt.pro, чтобы получить WebSocket-клиента, настроенного АБСОЛЮТНО
+        так же: те же ключи, та же passphrase, тот же обход подписи для
+        Aster (разные кошельки user/signer), те же demo-домены. Это
+        принципиально: приватный поток авторизуется теми же учётными
+        данными, что и боевые ордера — если бы конфиг собирался отдельно,
+        любое расхождение всплыло бы как «поток молчит» в самый неудобный
+        момент. Классы ccxt.pro наследуют ccxt.async_support, поэтому вся
+        логика ниже применима к ним без изменений."""
+        module = ccxt_module if ccxt_module is not None else ccxt_async
         # Приводим имя к ID класса CCXT: сначала смотрим алиасы (например,
         # "hliquid" -> "hyperliquid"), иначе просто берём имя в нижнем
         # регистре как есть (для большинства бирж оно и есть ID CCXT).
@@ -557,14 +810,14 @@ class TradeExecutionTool(BaseTool):
         # Не все биржи из канала сигналов есть в CCXT (например, OURBIT).
         # Явно проверяем поддержку и кидаем понятную ошибку вместо
         # AttributeError где-то в недрах getattr().
-        if not hasattr(ccxt_async, exchange_id):
+        if not hasattr(module, exchange_id):
             raise UnsupportedExchangeError(
                 f"Биржа '{exchange_name}' не поддерживается библиотекой CCXT"
             )
 
-        # getattr(ccxt_async, "bybit") эквивалентно ccxt_async.bybit —
+        # getattr(module, "bybit") эквивалентно module.bybit —
         # так мы динамически получаем класс биржи по её строковому имени.
-        exchange_class = getattr(ccxt_async, exchange_id)
+        exchange_class = getattr(module, exchange_id)
 
         api_key, api_secret = self._get_exchange_credentials(exchange_name)
         if _looks_like_placeholder(api_key) or _looks_like_placeholder(api_secret):
@@ -723,6 +976,23 @@ class TradeExecutionTool(BaseTool):
                 )
 
         return exchange
+
+    # -------------------------------------------------------------------
+    # ПРИВАТНЫЕ ПОТОКИ (см. private_stream.py) — поднимаются лениво, из
+    # уже работающего цикла бота. Клиент строится ТЕМ ЖЕ методом, что и
+    # боевой REST-клиент, только на классе ccxt.pro: одни и те же ключи,
+    # passphrase, обход подписи Aster и demo-домены. Расхождение конфигов
+    # здесь означало бы «поток молча не авторизовался» — ровно тот сорт
+    # поломки, который заметен не сразу и дорого обходится.
+    # -------------------------------------------------------------------
+    async def ensure_private_streams(self, exchange_names) -> None:
+        import ccxt.pro as ccxt_pro_module
+
+        for exchange_name in exchange_names:
+            await private_stream.subscribe(
+                exchange_name,
+                lambda n=exchange_name: self._build_exchange_client(n, ccxt_module=ccxt_pro_module),
+            )
 
     async def _get_ready_client(self, exchange_name: str):
         """Возвращает клиент CCXT с уже заполненными рынками.
@@ -901,6 +1171,98 @@ class TradeExecutionTool(BaseTool):
     # Вынесено в отдельную корутину, чтобы обе ноги сделки (long/short)
     # можно было запустить параллельно через asyncio.gather().
     # -------------------------------------------------------------------
+    async def warm_leverage(self, exchange_name: str, coin: str, side: str, leverage: int) -> bool:
+        """ФОНОВЫЙ прогрев: заранее выставить плечо для (биржа, монета,
+        сторона), чтобы реальный вход по этой связке не платил 0.5-1.9с за
+        set_leverage. Возвращает True, если что-то реально было выставлено
+        (False — уже было в кэше или не получилось).
+
+        Никогда не бросает исключений наружу: это оптимизация, а не
+        торговая логика. Если биржа отказала — просто не прогрели, вход
+        сделает это сам, как раньше."""
+        try:
+            exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+            symbol = _build_symbol(exchange_name, coin)
+            if (exchange_id, symbol, leverage, side) in _LEVERAGE_CONFIGURED:
+                return False
+            exchange = await self._get_ready_client(exchange_name)
+            if symbol not in exchange.markets:
+                return False  # монеты нет на этой бирже — прогревать нечего
+            await self.ensure_leverage_configured(exchange, exchange_name, symbol, side, leverage)
+            return True
+        except Exception as exc:
+            print(f"[leverage-warm] {exchange_name}/{coin} {side}: не удалось ({type(exc).__name__}: {exc})")
+            return False
+
+    async def ensure_leverage_configured(
+        self, exchange, exchange_name: str, symbol: str, side: str, leverage: int
+    ) -> str:
+        """Выставляет плечо и маржинальный режим для (биржа, символ, плечо,
+        сторона), если это ещё не сделано в этом процессе. Возвращает
+        exchange_id (он нужен вызывающему коду дальше).
+
+        Вынесено из _place_single_order 2026-09-14, когда добавился ФОНОВЫЙ
+        ПРОГРЕВ (scanner.py: _warm_leverage_for_candidates) — важно, чтобы
+        прогрев и реальная сделка шли ОДНИМ И ТЕМ ЖЕ кодом и писали в ОДИН
+        кэш: иначе прогрев мог бы выставить не то, что потом ждёт ордер, и
+        мы бы этого не заметили.
+
+        Зачем прогрев: замер 2026-09-14 показал, что set_leverage стоит
+        500-1875мс (aster 1875, gate 1172, bitget 610, mexc 609, binance
+        594, bybit 500), и на ПЕРВОЙ сделке по монете эту цену платил сам
+        вход. Биржа хранит настройку за символом, поэтому её можно сделать
+        заранее — тогда вход сразу идёт к create_order.
+
+        Ключ кэша включает leverage (смена плеча в .env должна
+        перенастроить символ) и side (у MEXC positionType зависит от
+        стороны)."""
+        exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+        key = (exchange_id, symbol, leverage, side)
+        if key in _LEVERAGE_CONFIGURED:
+            return exchange_id
+
+        # MEXC — особый случай: её set_leverage() требует ЯВНО указать
+        # openType (1=isolated/2=cross) и positionType (1=long/2=short)
+        # параметрами, иначе кидает ArgumentsRequired (проверено на реальном
+        # боевом ордере 2026-08-28 — без этого сделка на MEXC не
+        # открывается вообще).
+        leverage_params = {}
+        # CROSS margin — по явной просьбе пользователя 2026-09-06 ("давай
+        # вернём обратно на кросс на всех биржах"), после короткого
+        # перехода на isolated тем же вечером.
+        if exchange_id == "mexc":
+            leverage_params = {
+                "openType": MEXC_OPEN_TYPE_CROSS,
+                "positionType": 1 if side == "long" else 2,
+            }
+        elif exchange_id == "bitget":
+            # См. _ensure_bitget_one_way_mode — иначе ордер падает с 40774
+            # (несовпадение hedge_mode/one_way_mode аккаунта).
+            await self._ensure_bitget_one_way_mode(exchange, exchange_name, symbol)
+            # CROSS margin (см. MEXC_OPEN_TYPE_CROSS выше). У Bitget
+            # margin mode не связан с leverage/position mode — отдельный
+            # явный вызов; идемпотентно (если уже crossed, вернёт успех).
+            try:
+                await exchange.set_margin_mode("cross", symbol, params={"uta": False})
+            except ccxt_async.ExchangeError as exc:
+                print(f"[margin] {symbol}: не удалось явно выставить cross margin ({exc}) — продолжаю с текущим режимом счёта.")
+            # Тот же UTA — форсируем classic-эндпоинт и для set_leverage,
+            # для консистентности со всеми остальными bitget-вызовами.
+            leverage_params = {"uta": False}
+        elif exchange_id == "gate":
+            # У Gate margin mode задаётся ПРЯМО в вызове set_leverage (нет
+            # отдельного setMarginMode — см. исходник ccxt gate.py:
+            # set_leverage): без marginMode='cross' запрос уходит в
+            # изолированном формате (request['leverage']=N) — именно так
+            # было ДО просьбы пользователя 2026-09-06 вернуть кросс. С
+            # marginMode='cross' CCXT сам переключает запрос в кросс-формат
+            # (request['cross_leverage_limit']=N, request['leverage']='0').
+            leverage_params = {"marginMode": "cross"}
+
+        await self._set_leverage_with_fallback(exchange, leverage, symbol, leverage_params)
+        _LEVERAGE_CONFIGURED.add(key)
+        return exchange_id
+
     async def _place_single_order(
         self, exchange_name: str, coin: str, side: str, amount_usdt: float, leverage: int,
         known_price: Optional[float] = None,
@@ -963,51 +1325,23 @@ class TradeExecutionTool(BaseTool):
                 # следующий вызов снова получит из кэша неполный список.
                 _warm_markets_cache[EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())] = exchange.markets
 
-            # Выставляем кредитное плечо перед открытием позиции. MEXC —
-            # особый случай: её set_leverage() требует ЯВНО указать
-            # openType (1=isolated/2=cross) и positionType (1=long/2=short)
-            # параметрами, иначе кидает ArgumentsRequired (проверено на
-            # реальном боевом ордере 2026-08-28 — без этого сделка на MEXC
-            # не открывается вообще).
-            leverage_params = {}
-            exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
-            # CROSS margin — по явной просьбе пользователя 2026-09-06
-            # ("давай вернём обратно на кросс на всех биржах"), после
-            # короткого перехода на isolated тем же вечером.
-            mexc_open_type = 2  # 1 = isolated, 2 = cross
-            if exchange_id == "mexc":
-                leverage_params = {
-                    "openType": mexc_open_type,
-                    "positionType": 1 if side == "long" else 2,
-                }
-            elif exchange_id == "bitget":
-                # См. _ensure_bitget_one_way_mode — иначе ордер падает с
-                # 40774 (несовпадение hedge_mode/one_way_mode аккаунта).
-                await self._ensure_bitget_one_way_mode(exchange, exchange_name, symbol)
-                # CROSS margin (см. коммент у mexc_open_type выше — просьба
-                # пользователя 2026-09-06 вернуть кросс на всех биржах). У
-                # Bitget margin mode не связан с leverage/position mode —
-                # отдельный явный вызов; идемпотентно (если уже crossed,
-                # просто вернёт успех).
-                try:
-                    await exchange.set_margin_mode("cross", symbol, params={"uta": False})
-                except ccxt_async.ExchangeError as exc:
-                    print(f"[margin] {symbol}: не удалось явно выставить cross margin ({exc}) — продолжаю с текущим режимом счёта.")
-                # См. тот же комментарий про UTA — форсируем classic-эндпоинт
-                # и для set_leverage тоже, для консистентности со всеми
-                # остальными bitget-вызовами этой ноги.
-                leverage_params = {"uta": False}
-            elif exchange_id == "gate":
-                # У Gate margin mode задаётся ПРЯМО в вызове set_leverage
-                # (нет отдельного setMarginMode — см. исходник ccxt
-                # gate.py:set_leverage): без marginMode='cross' запрос
-                # уходит в изолированном формате (request['leverage']=N) —
-                # именно так был устроен код ДО просьбы пользователя
-                # 2026-09-06 вернуть кросс на всех биржах. С marginMode=
-                # 'cross' CCXT сам переключает запрос в кросс-формат
-                # (request['cross_leverage_limit']=N, request['leverage']='0').
-                leverage_params = {"marginMode": "cross"}
-            await self._set_leverage_with_fallback(exchange, leverage, symbol, leverage_params)
+            # КЭШ «ПЛЕЧО УЖЕ ВЫСТАВЛЕНО» (добавлено 2026-09-13 по разбору
+            # [timing] ANTHROPIC: фаза ордеров 2515мс при 360мс на стакан).
+            # set_leverage/set_margin_mode — это НАСТРОЙКИ СИМВОЛА, которые
+            # биржа ХРАНИТ: выставили 5x cross для монеты один раз — оно там
+            # и остаётся. Раньше эти 1-2 запроса уходили ПЕРЕД КАЖДЫМ ордером
+            # — на gate (~500-950мс на запрос сегодня) это до трети всей
+            # задержки ноги впустую. Теперь первая сделка по паре
+            # (биржа, символ, плечо, сторона) настраивает и запоминает, все
+            # следующие — сразу к create_order. Ключ включает leverage, чтобы
+            # смена плеча в .env (3x -> 5x сегодня) гарантированно
+            # перенастроила символ, и side — у MEXC positionType зависит от
+            # стороны. Кэш живёт в памяти процесса: рестарт = перенастройка.
+            # Плечо/маржинальный режим — единый метод для реальной сделки
+            # и для фонового прогрева (см. ensure_leverage_configured).
+            exchange_id = await self.ensure_leverage_configured(
+                exchange, exchange_name, symbol, side, leverage
+            )
 
             # ЦЕНА ДЛЯ РАСЧЁТА ОБЪЁМА — если вызывающий код (_open_both_legs_async,
             # после проверки направления) уже получил свежую цену буквально
@@ -1049,7 +1383,7 @@ class TradeExecutionTool(BaseTool):
                 # CCXT внутри create_swap_order_request) — иначе есть риск
                 # рассинхрона между margin-режимом, для которого выставлено
                 # плечо (set_leverage выше), и margin-режимом самого ордера.
-                order_params["openType"] = mexc_open_type
+                order_params["openType"] = MEXC_OPEN_TYPE_CROSS
             elif exchange_id == "bitget":
                 # См. _ensure_bitget_one_way_mode — тот же форс classic-
                 # эндпоинта вместо UTA, иначе именно ЭТОТ вызов (а не только
@@ -1121,7 +1455,7 @@ class TradeExecutionTool(BaseTool):
             # биржей, оставляя вторую ногу спреда РЕАЛЬНО открытой и
             # НЕЗАХЕДЖИРОВАННОЙ (rollback не срабатывал, т.к. эта нога
             # считалась успешной).
-            order = await _verify_order_filled(exchange, order, symbol, exchange_id)
+            order = await _verify_order_filled(exchange, order, symbol, exchange_id, exchange_name)
             filled = order.get("filled") or 0
             status = order.get("status")
             if status == "canceled" or filled <= 0:
@@ -1132,6 +1466,8 @@ class TradeExecutionTool(BaseTool):
                 )
 
             fill_price = await _resolve_fill_price(exchange, order, symbol, exchange_id)
+            _learn_fee_from_fill(exchange_id, order)  # реальная комиссия -> кэш ставок (см. _FEE_RATE_CACHE)
+            _invalidate_balance(exchange_name)  # маржа изменилась — кэш баланса больше не годится
             if fill_price is None:
                 fill_price = price  # тикер ДО ордера — крайний случай, как раньше
             # filled_amount_coin — РЕАЛЬНО исполненное количество монеты
@@ -1227,38 +1563,50 @@ class TradeExecutionTool(BaseTool):
         api_key, api_secret = cls._get_exchange_credentials(exchange_name)
         return not _looks_like_placeholder(api_key) and not _looks_like_placeholder(api_secret)
 
-    @staticmethod
-    async def _get_taker_fee_rate(exchange_name: str, symbol: str) -> Optional[float]:
-        """Возвращает реальную ставку taker-комиссии биржи для символа
-        (например, 0.00055 = 0.055%) — берётся напрямую с биржи через
-        публичный (не требующий ключей) метод load_markets(), а не из
-        усреднённых цифр "из интернета": у разных аккаунтов бывают разные
-        тарифы/скидки (VIP-уровень, скидка за токен биржи и т.п.), и это
-        видно только через API конкретного аккаунта/символа.
-        Открывающие и закрывающие ордера в этом боте — рыночные (type=
-        'market'), а market-ордера почти на всех биржах исполняются как
-        taker (снимают ликвидность из стакана), поэтому именно taker-ставка
-        релевантна для отчёта, а не maker."""
-        exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
-        if not hasattr(ccxt_async, exchange_id):
-            return None
+    async def _get_taker_fee_rate(self, exchange_name: str, symbol: str) -> Optional[float]:
+        """Ставка taker-комиссии биржи (например, 0.0008 = 0.08%) — из КЭША,
+        мгновенно, без сетевых запросов на пути сделки.
 
-        exchange_class = getattr(ccxt_async, exchange_id)
-        # Публичный клиент БЕЗ ключей — market fee rate это открытые данные
-        # (список торговых пар и их условий), авторизация не нужна.
-        # timeout — см. _build_exchange_client, та же защита от зависания.
-        exchange = exchange_class({"enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": 15000})
+        ПЕРЕПИСАНО 2026-09-13 (см. большой комментарий у _FEE_RATE_CACHE):
+        раньше на каждую сделку создавался новый клиент и качался ВЕСЬ
+        список рынков (12-16с, регулярные таймауты, None в журнале), а
+        ставка бралась из публичного справочника CCXT, который на mexc/
+        bybit/bitget занижал реальную комиссию в 1.7-4 раза.
+
+        Приоритет: fill (реальная, с наших исполнений) > override (.env) >
+        static (market["taker"] с УЖЕ загруженного персистентного клиента,
+        кэш на FEE_RATE_CACHE_TTL_SECONDS). Метод стал instance-методом
+        (был @staticmethod), т.к. фолбэку нужен self._get_ready_client —
+        все вызовы и так шли через self."""
+        exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+
+        # 1) Реальная ставка с наших же исполнений — всегда лучше любых
+        #    справочников; не устаревает, обновляется каждой сделкой.
+        cached = _FEE_RATE_CACHE.get(exchange_id)
+        if cached and cached.get("source") == "fill" and cached.get("rate"):
+            return cached["rate"]
+
+        # 2) Явная ставка из .env (посеяно реальными замерами 2026-09-13) —
+        #    пока по бирже нет ни одного своего исполнения.
+        override = _fee_overrides().get(exchange_id)
+        if override is not None:
+            return override
+
+        # 3) Статичная из справочника, но БЕЗ нового клиента и БЕЗ
+        #    load_markets — рынки у персистентного клиента уже в памяти.
+        if cached and cached.get("rate") and time.monotonic() - cached["ts"] < _fee_cache_ttl_seconds():
+            return cached["rate"]
         try:
-            await exchange.load_markets()
-            market = exchange.markets.get(symbol)
-            return market.get("taker") if market else None
+            exchange = await self._get_ready_client(exchange_name)
+            market = exchange.markets.get(symbol) if exchange.markets else None
+            rate = market.get("taker") if market else None
         except Exception:
-            # Не удалось получить ставку (сеть, символ не найден и т.п.) —
-            # не роняем весь отчёт из-за этого, просто вернём None, и
-            # main.py покажет "неизвестно" вместо процента.
-            return None
-        finally:
-            await exchange.close()
+            rate = None
+        if rate is not None:
+            _FEE_RATE_CACHE[exchange_id] = {"rate": rate, "ts": time.monotonic(), "source": "static"}
+            return rate
+        # Ничего не получили — отдаём хоть протухший кэш, если он есть.
+        return cached.get("rate") if cached else None
 
     @staticmethod
     def _vwap_from_levels(levels, amount_usdt: float) -> Optional[float]:
@@ -1306,6 +1654,56 @@ class TradeExecutionTool(BaseTool):
         if total_amount <= 0:
             return None
         return total_cost / total_amount  # VWAP
+
+    async def _refresh_balance_if_stale(self, exchange_name: str, max_age_seconds: float) -> None:
+        """Обновить кэш баланса, если он старше max_age_seconds. Вызывается
+        из ФОНОВОГО цикла сверки позиций (scanner.py), чтобы к моменту
+        реальной сделки баланс уже лежал в кэше и вход не платил 0.7-2.0с
+        за его запрос. Ничего не возвращает и никогда не бросает наружу —
+        это чистый прогрев."""
+        exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+        cached = _BALANCE_CACHE.get(exchange_id)
+        if cached and time.monotonic() - cached["ts"] < max_age_seconds:
+            return
+        # Сбрасываем запись, чтобы _get_free_balance пошёл за свежей (он
+        # сам положит результат в кэш).
+        _BALANCE_CACHE.pop(exchange_id, None)
+        try:
+            await self._get_free_balance(exchange_name)
+        except Exception:
+            pass
+
+    async def _get_free_balance(self, exchange_name: str) -> "float | None":
+        """СВОБОДНЫЙ (не занятый под открытые позиции) баланс биржи в её
+        валюте расчёта. None при любой ошибке — вызывающий код тогда просто
+        не блокирует сделку (fail-open: лучше попробовать и получить отказ
+        биржи, чем молча не торговать из-за сбоя вспомогательного запроса).
+
+        Добавлено 2026-09-13 после реального случая CVC: gate отклонил ногу
+        по нехватке маржи ("margin 5.042336 while available 3.00354988277")
+        уже ПОСЛЕ того, как вторая нога на bybit успешно открылась — деньги
+        ушли на комиссию за открытие и откат впустую. Причина нехватки была
+        известна заранее: на gate $5.09 из $8.74 заперты под другой
+        открытой позицией (MTL), а свободных оставалось всего $3."""
+        exchange_id_cache = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+        cached = _BALANCE_CACHE.get(exchange_id_cache)
+        if cached and time.monotonic() - cached["ts"] < _balance_cache_ttl():
+            return cached["free"]
+        try:
+            exchange = await self._get_ready_client(exchange_name)
+            balance = await exchange.fetch_balance()
+        except Exception as exc:
+            print(f"[balance] {exchange_name}: не удалось получить баланс ({type(exc).__name__}: {exc})")
+            return None
+        # Hyperliquid считает в USDC, остальные наши биржи — в USDT
+        # (см. EXCHANGE_QUOTE_CURRENCY).
+        exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+        currency = EXCHANGE_QUOTE_CURRENCY.get(exchange_id, "USDT")
+        entry = balance.get(currency) or {}
+        free = entry.get("free")
+        if free is not None:
+            _BALANCE_CACHE[exchange_id_cache] = {"free": free, "ts": time.monotonic()}
+        return free
 
     async def _get_book_snapshot(
         self, exchange_name: str, coin: str, amount_usdt: float
@@ -1390,7 +1788,8 @@ class TradeExecutionTool(BaseTool):
     # языковой моделью для реальных денег не стоит).
     # -------------------------------------------------------------------
     async def _open_both_legs_async(
-        self, coin: str, long_exchange: str, short_exchange: str, amount_usdt: Optional[float] = None
+        self, coin: str, long_exchange: str, short_exchange: str, amount_usdt: Optional[float] = None,
+        prefetched_books=None, prefetched_books_at=None,
     ) -> dict:
         # amount_usdt можно передать явно (например, scanner.py передаёт
         # AUTO_TRADE_AMOUNT_USDT — свой размер сделки для авто-найденных
@@ -1460,6 +1859,18 @@ class TradeExecutionTool(BaseTool):
         # — не блокируем сделку, торгуем как задано сигналом (см.
         # _get_book_snapshot: возвращает None при любой ошибке).
         # =====================================================================
+        # ЗАМЕР ПО ШАГАМ (добавлено 2026-09-13 по прямой просьбе
+        # пользователя — "не знаем, где именно теряем секунды"): раньше
+        # измерялась ТОЛЬКО отправка самих ордеров (elapsed_ms ниже), и
+        # общая задержка 2.8-3.4с была чёрным ящиком — невозможно сказать,
+        # что именно тормозит: стакан, проверки, сами ордера или запрос
+        # комиссий. Теперь каждый этап замеряется отдельно и печатается
+        # строкой [timing], а разбивка едет в trade_ledger (см. timings в
+        # возвращаемом словаре) — чтобы оптимизировать по фактам, а не на
+        # ощупь.
+        timings: dict = {}
+        phase_start = time.monotonic()
+
         long_price_check = short_price_check = None
         if not dry_run:
             # ОДИН запрос стакана на биржу вместо двух последовательных
@@ -1469,10 +1880,47 @@ class TradeExecutionTool(BaseTool):
             # (для направления), и VWAP на обе стороны (для spread-check
             # ниже), какая бы сторона ни досталась этой бирже после
             # определения направления.
-            long_snapshot, short_snapshot = await asyncio.gather(
-                self._get_book_snapshot(long_exchange, coin, amount_usdt),
-                self._get_book_snapshot(short_exchange, coin, amount_usdt),
+            # Балансы тянем В ТОМ ЖЕ gather'е, что и стаканы (добавлено
+            # 2026-09-13 после реального случая CVC: gate отклонил ногу по
+            # марже — "margin 5.04 while available 3.00" — уже ПОСЛЕ того,
+            # как нога на bybit успешно открылась, и мы заплатили комиссию
+            # за её открытие + откат впустую). Проверка баланса ДО отправки
+            # ордеров это предотвращает, а раз она едет параллельно с уже
+            # существующим запросом стаканов — общая задержка входа НЕ
+            # растёт (ждём максимум из четырёх запросов вместо максимума
+            # из двух, а они примерно одинаковы по времени).
+            # ПЕРЕИСПОЛЬЗОВАНИЕ СВЕЖИХ СТАКАНОВ (добавлено 2026-09-14):
+            # scanner.py только что запрашивал ровно эти же стаканы в своей
+            # ранней проверке спреда (early-spread-check) и передал их сюда.
+            # Повторный запрос стоил ~560мс медианы по [timing] и ничего не
+            # уточнял: между теми двумя точками обычно миллисекунды, т.к.
+            # проверка схождения почти всегда берётся из кэша. Но если она
+            # НЕ попала в кэш (реальный запрос часовых свечей с двух бирж —
+            # это секунды), снимок успевает устареть, и тогда честно
+            # запрашиваем заново: решение о входе принимается по свежей
+            # книге, экономия не должна этого ломать.
+            max_age = float(os.getenv("PREFETCHED_BOOK_MAX_AGE_SECONDS", "1.0"))
+            reuse_books = (
+                prefetched_books
+                and all(b is not None for b in prefetched_books)
+                and prefetched_books_at is not None
+                and (time.monotonic() - prefetched_books_at) <= max_age
             )
+            if reuse_books:
+                (long_snapshot, short_snapshot), (long_balance, short_balance) = prefetched_books, await asyncio.gather(
+                    self._get_free_balance(long_exchange),
+                    self._get_free_balance(short_exchange),
+                )
+                timings["book_snapshot_reused"] = True
+            else:
+                long_snapshot, short_snapshot, long_balance, short_balance = await asyncio.gather(
+                    self._get_book_snapshot(long_exchange, coin, amount_usdt),
+                    self._get_book_snapshot(short_exchange, coin, amount_usdt),
+                    self._get_free_balance(long_exchange),
+                    self._get_free_balance(short_exchange),
+                )
+            timings["book_snapshot_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
+            phase_start = time.monotonic()
             long_price_check = long_snapshot.get("reference_price") if long_snapshot else None
             short_price_check = short_snapshot.get("reference_price") if short_snapshot else None
 
@@ -1571,6 +2019,86 @@ class TradeExecutionTool(BaseTool):
                     "elapsed_ms": None,
                 }
 
+        # ГАРД НА ПЕРЕРАЗМЕР (добавлено 2026-09-13 по прямой просьбе
+        # пользователя — см. _estimate_min_notional). Если минимальный лот
+        # монеты на ЛЮБОЙ из двух бирж заметно дороже нашего целевого
+        # номинала, раньше мы молча открывались НА БОЛЬШЕЕ (реальный
+        # ANTHROPIC: цель $8 -> факт ~$21 на ногу, в 2.6 раза больше
+        # задуманного риска). Теперь — отменяем сделку ДО отправки ордеров,
+        # как и spread-check выше. Проверяем ОБЕ ноги ДО gather'а: если
+        # отказаться уже после старта корутин, одна нога могла бы открыться,
+        # а вторая нет — и пришлось бы платить за откат.
+        if not dry_run:
+            try:
+                max_overshoot = float(os.getenv("TRADE_MAX_MIN_LOT_OVERSHOOT", "1.5"))
+            except (TypeError, ValueError):
+                max_overshoot = 1.5
+            for leg_exchange, leg_price, leg_free in (
+                (long_exchange, long_price_check, long_balance),
+                (short_exchange, short_price_check, short_balance),
+            ):
+                try:
+                    leg_client = await self._get_ready_client(leg_exchange)
+                    leg_symbol = _build_symbol(leg_exchange, coin)
+                    leg_market = leg_client.market(leg_symbol)
+                except Exception:
+                    continue  # метаданные рынка недоступны — не блокируем (fail-open)
+                leg_contract_size = leg_market.get("contractSize") or 1
+                min_notional = _estimate_min_notional(leg_market, leg_price, leg_contract_size)
+
+                # ПРОВЕРКА СВОБОДНОЙ МАРЖИ (добавлено 2026-09-13, реальный
+                # случай CVC — см. _get_free_balance). Считаем по ФАКТИЧЕСКОМУ
+                # номиналу: если минимальный лот дороже нашей цели, реально
+                # уйдёт именно он (_bump_amount_to_minimum), и маржи нужно
+                # больше. +10% запас на комиссию и движение цены между
+                # проверкой и исполнением. leg_free=None означает, что баланс
+                # получить не удалось — тогда НЕ блокируем (fail-open, тот же
+                # принцип, что и у остальных вспомогательных проверок).
+                real_notional = max(amount_usdt, min_notional or 0)
+                required_margin = (real_notional / max(1, leverage)) * 1.1
+                if leg_free is not None and leg_free < required_margin:
+                    print(
+                        f"[balance-guard] {coin.upper()}: на {leg_exchange} свободно "
+                        f"${leg_free:.2f}, а под ногу нужно ~${required_margin:.2f} "
+                        f"(номинал ${real_notional:.2f} при плече {leverage}x) — сделка "
+                        f"отменена ДО отправки ордеров, чтобы не открыть одну ногу и не "
+                        f"платить за её откат."
+                    )
+                    return {
+                        "coin": coin.upper(),
+                        "cancelled": True,
+                        "reason": (
+                            f"недостаточно свободной маржи на {leg_exchange}: "
+                            f"${leg_free:.2f} при необходимых ~${required_margin:.2f}"
+                        ),
+                        "long": None,
+                        "short": None,
+                        "elapsed_ms": None,
+                    }
+
+                if min_notional and min_notional > amount_usdt * max_overshoot:
+                    print(
+                        f"[size-guard] {coin.upper()}: минимальный лот на {leg_exchange} стоит "
+                        f"~${min_notional:.2f} при цели ${amount_usdt:.2f} на ногу "
+                        f"(предел {max_overshoot}x = ${amount_usdt * max_overshoot:.2f}) — "
+                        f"сделка отменена ДО отправки ордеров, чтобы не открывать позицию "
+                        f"больше задуманной."
+                    )
+                    return {
+                        "coin": coin.upper(),
+                        "cancelled": True,
+                        "reason": (
+                            f"минимальный лот на {leg_exchange} (~${min_notional:.2f}) превышает "
+                            f"целевой размер ${amount_usdt:.2f} более чем в {max_overshoot}x — "
+                            f"сделка отменена до отправки ордеров"
+                        ),
+                        "long": None,
+                        "short": None,
+                        "elapsed_ms": None,
+                    }
+
+        timings["pre_order_checks_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
+
         start_time = time.monotonic()  # Засекаем момент старта обеих корутин
 
         # asyncio.gather() запускает обе корутины ОДНОВРЕМЕННО (конкурентно)
@@ -1585,6 +2113,8 @@ class TradeExecutionTool(BaseTool):
         )
 
         elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
+        timings["orders_ms"] = elapsed_ms
+        phase_start = time.monotonic()
 
         # amount_in_coin нужен боту позже, чтобы ЗАКРЫТЬ ровно тот же объём
         # (см. close_spread). В DRY_RUN и при ошибке цены нет — тогда
@@ -1756,11 +2286,17 @@ class TradeExecutionTool(BaseTool):
                     f"Последняя причина: {failure_reason}"
                 )
             if blocked_coins_store.is_permanent_error(failure_reason):
-                if blocked_coins_store.auto_exclude_coin(coin):
+                # ТОЧЕЧНОЕ исключение (coin:биржа), а не глобальный бан монеты
+                # на всех биржах — см. auto_exclude_coin_on_exchange, по явной
+                # просьбе пользователя 2026-09-11. Ошибка произошла именно на
+                # short_exchange (та нога не открылась), поэтому исключаем
+                # монету именно там, а не везде.
+                if blocked_coins_store.auto_exclude_coin_on_exchange(coin, short_exchange):
                     print(
-                        f"[excluded] {coin.upper()}: ошибка биржи заведомо не исправится "
-                        f"повторной попыткой ('contract not activated') — монета добавлена "
-                        f"в SCANNER_EXCLUDED_COINS (.env) по правилу пользователя от 2026-09-09."
+                        f"[excluded] {coin.upper()}:{short_exchange}: ошибка биржи заведомо не "
+                        f"исправится повторной попыткой ('contract not activated') — пара "
+                        f"добавлена в SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS (.env), монета "
+                        f"по-прежнему торгуется на остальных биржах."
                     )
             # SHORT на short_exchange был признан неудавшимся — именно эту
             # ногу перепроверяем мгновенно в фоне (см. _delayed_leg_recheck).
@@ -1783,15 +2319,40 @@ class TradeExecutionTool(BaseTool):
                     f"Последняя причина: {failure_reason}"
                 )
             if blocked_coins_store.is_permanent_error(failure_reason):
-                if blocked_coins_store.auto_exclude_coin(coin):
+                # Симметрично ветке выше — ошибка произошла на long_exchange
+                # (та нога не открылась), исключаем монету именно там.
+                if blocked_coins_store.auto_exclude_coin_on_exchange(coin, long_exchange):
                     print(
-                        f"[excluded] {coin.upper()}: ошибка биржи заведомо не исправится "
-                        f"повторной попыткой ('contract not activated') — монета добавлена "
-                        f"в SCANNER_EXCLUDED_COINS (.env) по правилу пользователя от 2026-09-09."
+                        f"[excluded] {coin.upper()}:{long_exchange}: ошибка биржи заведомо не "
+                        f"исправится повторной попыткой ('contract not activated') — пара "
+                        f"добавлена в SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS (.env), монета "
+                        f"по-прежнему торгуется на остальных биржах."
                     )
             # LONG на long_exchange был признан неудавшимся — перепроверяем
             # именно эту ногу мгновенно в фоне (см. _delayed_leg_recheck).
             asyncio.create_task(self._delayed_leg_recheck(long_exchange, coin, "long"))
+        elif not long_ok and not short_ok:
+            # НИ ОДНА нога не открылась вообще — реальный случай 2026-09-12
+            # (MICRODUCK): mexc отдал "contract not activated", а gate В ТО
+            # ЖЕ ВРЕМЯ отклонил по СОВСЕМ другой причине (нехватка маржи).
+            # Ветки выше проверяют auto-exclude ТОЛЬКО когда ровно одна
+            # нога успешна (та, что осталась, откатывается) — если падают
+            # ОБЕ сразу, ни одна из них туда не попадает, и повторяющаяся
+            # "contract not activated" никогда не приводит к исключению
+            # монеты на этой бирже. Откатывать здесь нечего (обе ноги и
+            # так не открылись, денег никто не тратил), но КАЖДУЮ ногу
+            # всё равно проверяем на постоянную ошибку независимо от
+            # результата другой.
+            for leg_result, leg_exchange in ((long_result, long_exchange), (short_result, short_exchange)):
+                leg_status = leg_result.get("status") or ""
+                if blocked_coins_store.is_permanent_error(leg_status):
+                    if blocked_coins_store.auto_exclude_coin_on_exchange(coin, leg_exchange):
+                        print(
+                            f"[excluded] {coin.upper()}:{leg_exchange}: ошибка биржи заведомо не "
+                            f"исправится повторной попыткой ('contract not activated') — пара "
+                            f"добавлена в SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS (.env), монета "
+                            f"по-прежнему торгуется на остальных биржах."
+                        )
 
         # Комиссии за вход. Ордера рыночные (type="market") — на
         # подавляющем большинстве бирж это taker-исполнение, поэтому берём
@@ -1805,10 +2366,28 @@ class TradeExecutionTool(BaseTool):
             leg_result["taker_fee_rate"] = fee_rate
             leg_result["fee_usdt"] = amount_usdt * fee_rate if fee_rate is not None else None
 
+        timings["fee_lookup_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
+        timings["total_ms"] = round(sum(timings.values()), 1)
+        # ПОМЕТКА О ПРЕДСТАВИТЕЛЬНОСТИ ЗАМЕРА (добавлено 2026-09-14 по
+        # прямой просьбе пользователя после разбора артефакта): у боевого
+        # входа стакан приходит готовым из early-spread-check сканера, а у
+        # любого вызова в обход сканера (тестовый скрипт, сигнал канала) —
+        # запрашивается тут же и стоит ~1.5с. Числа при этом выглядят
+        # одинаково, и один раз я уже сравнил боевой путь с синтетическим,
+        # не заметив разницы. Теперь строка сама говорит, что это было.
+        reused = timings.get("book_snapshot_reused")
+        source = "стакан ГОТОВЫЙ из сканера" if reused else "стакан ЗАПРОШЕН здесь — НЕ боевой путь"
+        print(
+            f"[timing] {coin.upper()} ОТКРЫТИЕ: стакан {timings.get('book_snapshot_ms', 0)}мс ({source}) + "
+            f"проверки {timings.get('pre_order_checks_ms', 0)}мс + ордера {timings.get('orders_ms', 0)}мс + "
+            f"комиссии {timings.get('fee_lookup_ms', 0)}мс = {timings['total_ms']}мс всего"
+        )
+
         return {
             "coin": coin.upper(),
             "cancelled": False,
             "reason": None,
+            "timings": timings,
             # long_exchange/short_exchange — ФАКТИЧЕСКИ использованные биржи
             # (после возможной перестановки местами, см. "ПРОВЕРКА
             # НАПРАВЛЕНИЯ ВХОДА" выше) — вызывающий код (trade_executor.py)
@@ -2120,7 +2699,7 @@ class TradeExecutionTool(BaseTool):
             # критична: ложный "OK" на закрытии означает, что бот считает
             # позицию закрытой, хотя она физически осталась открытой —
             # риск остаётся, но НЕВИДИМЫМ для дальнейшего мониторинга.
-            order = await _verify_order_filled(exchange, order, symbol, exchange_id)
+            order = await _verify_order_filled(exchange, order, symbol, exchange_id, exchange_name)
             filled = order.get("filled") or 0
             status = order.get("status")
             if status == "canceled" or filled <= 0:
@@ -2131,6 +2710,8 @@ class TradeExecutionTool(BaseTool):
                 )
 
             price = await _resolve_fill_price(exchange, order, symbol, exchange_id)
+            _learn_fee_from_fill(exchange_id, order)  # реальная комиссия -> кэш ставок (см. _FEE_RATE_CACHE)
+            _invalidate_balance(exchange_name)  # маржа изменилась — кэш баланса больше не годится
             if not price:
                 # Не все биржи сразу возвращают цену исполнения рыночного
                 # ордера в ответе create_order, и повторный запрос ордера
@@ -2187,6 +2768,8 @@ class TradeExecutionTool(BaseTool):
         long_amount_coin: float,
         short_amount_coin: float,
     ) -> dict:
+        # Замер по шагам — см. комментарий у timings в _open_both_legs_async.
+        timings: dict = {}
         start_time = time.monotonic()
 
         long_result, short_result = await asyncio.gather(
@@ -2195,6 +2778,8 @@ class TradeExecutionTool(BaseTool):
         )
 
         elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
+        timings["orders_ms"] = elapsed_ms
+        phase_start = time.monotonic()
 
         # Комиссии за ВЫХОД — те же рыночные (taker) ордера, что и на
         # входе. Считаем от фактической суммы закрытия (объём × цена
@@ -2214,11 +2799,19 @@ class TradeExecutionTool(BaseTool):
                 else None
             )
 
+        timings["fee_lookup_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
+        timings["total_ms"] = round(sum(timings.values()), 1)
+        print(
+            f"[timing] {coin.upper()} ЗАКРЫТИЕ: ордера {timings['orders_ms']}мс + "
+            f"комиссии {timings['fee_lookup_ms']}мс = {timings['total_ms']}мс всего"
+        )
+
         return {
             "coin": coin.upper(),
             "long": long_result,
             "short": short_result,
             "elapsed_ms": elapsed_ms,
+            "timings": timings,
         }
 
     # -------------------------------------------------------------------

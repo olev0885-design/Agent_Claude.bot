@@ -114,10 +114,9 @@ class TelegramNotifier:
                 print(f"[notifier] Не удалось отправить Telegram-уведомление ({recipient}): {exc}")
 
     # -------------------------------------------------------------------
-    # 🟢 ВХОД В СДЕЛКУ — дублируется в @Depositik (по явной просьбе
-    # пользователя 2026-09-06: "как только заходим в ордер — отправляй всю
-    # информацию по нему в Telegram на @Depositik") в ДОПОЛНЕНИЕ к обычной
-    # отправке в Saved Messages ("me"), а не вместо неё.
+    # 🟢 ВХОД В СДЕЛКУ — дублируется в @Depositik и @G_Pobedonosec (по
+    # явной просьбе пользователя 2026-09-06/2026-09-12) в ДОПОЛНЕНИЕ к
+    # обычной отправке в Saved Messages ("me"), а не вместо неё.
     # -------------------------------------------------------------------
     def notify_open(
         self,
@@ -128,34 +127,47 @@ class TelegramNotifier:
         short_exchange: str,
         short_price,
         spread=None,
+        elapsed_ms=None,
     ) -> None:
+        # elapsed_ms (добавлено 2026-09-12 по прямой просьбе пользователя
+        # "отправляй... информацию по задержке на ноги") — задержка МЕЖДУ
+        # ногами при открытии (см. _open_both_legs_async в trade_tool.py),
+        # раньше видна была только в консоли/тексте отчёта, в структурное
+        # Telegram-уведомление не попадала вообще.
+        latency_line = f"\n• **Задержка между ногами:** {elapsed_ms:.0f} мс" if elapsed_ms is not None else ""
         text = (
             "🟢 **ВХОД В СДЕЛКУ (Arbitrage / Funding)**\n"
             f"• **Монета:** {symbol}\n"
             f"• **Long биржа:** {long_exchange} (Цена: {_fmt_price(long_price)})\n"
             f"• **Short биржа:** {short_exchange} (Цена: {_fmt_price(short_price)})\n"
-            f"• **Текущий спред/фандинг:** {_fmt_spread(spread)}\n"
+            f"• **Текущий спред/фандинг:** {_fmt_spread(spread)}"
+            f"{latency_line}\n"
             f"• **Время:** {_now_str()}"
         )
-        self._dispatch(text, recipients=("me", "@Depositik"))
+        self._dispatch(text, recipients=("me", "@Depositik", "@G_Pobedonosec"))
 
     # -------------------------------------------------------------------
-    # 🔴 ЗАКРЫТИЕ СДЕЛКИ — дублируется в @Depositik (та же просьба
-    # пользователя 2026-09-07, что и для ВХОДА в сделку: "по закрытию
-    # ордера тоже отправляй всю информацию в @Depositik").
+    # 🔴 ЗАКРЫТИЕ СДЕЛКИ — дублируется в @Depositik и @G_Pobedonosec (та же
+    # просьба пользователя 2026-09-07/2026-09-12, что и для ВХОДА).
     # -------------------------------------------------------------------
-    def notify_close(self, *, symbol: str, reason: str, pnl_amount, pnl_percent) -> None:
+    def notify_close(self, *, symbol: str, reason: str, pnl_amount, pnl_percent, elapsed_ms=None) -> None:
+        latency_line = f"\n• **Задержка между ногами:** {elapsed_ms:.0f} мс" if elapsed_ms is not None else ""
         text = (
             "🔴 **ЗАКРЫТИЕ СДЕЛКИ**\n"
             f"• **Монета:** {symbol}\n"
             f"• **Причина закрытия:** {reason}\n"
-            f"• **Итоговый PnL:** {_fmt_pnl_amount(pnl_amount)} ({_fmt_pnl_percent(pnl_percent)})\n"
+            f"• **Итоговый PnL:** {_fmt_pnl_amount(pnl_amount)} ({_fmt_pnl_percent(pnl_percent)})"
+            f"{latency_line}\n"
             f"• **Время:** {_now_str()}"
         )
-        self._dispatch(text, recipients=("me", "@Depositik"))
+        self._dispatch(text, recipients=("me", "@Depositik", "@G_Pobedonosec"))
 
     # -------------------------------------------------------------------
-    # ⚠️ ОШИБКА ИСПОЛНЕНИЯ
+    # ⚠️ ОШИБКА ИСПОЛНЕНИЯ — ОБНОВЛЕНО 2026-09-12 (дважды за день) по
+    # прямой просьбе пользователя: сначала убрали @Depositik/@G_Pobedonosec
+    # отсюда, потом пользователь явно попросил вернуть именно ошибки
+    # ОТКРЫТИЯ ордера обратно на оба аккаунта ("отправляй... ошибки при
+    # открытии ордера") — дублируем снова.
     # -------------------------------------------------------------------
     def notify_error(self, *, symbol: str, error_message: str) -> None:
         text = (
@@ -163,13 +175,17 @@ class TelegramNotifier:
             f"• **Монета:** {symbol}\n"
             f"• **Детали:** {error_message}"
         )
-        self._dispatch(text)
+        self._dispatch(text, recipients=("me", "@Depositik", "@G_Pobedonosec"))
 
     # -------------------------------------------------------------------
     # ⚡ AUTO-TRADE: сканер начинает открывать сделку (см. scanner.py) —
     # отправляется ДО вызова execute_arbitrage_trade, чтобы вы видели факт
     # попытки входа сразу, не дожидаясь результата исполнения ордеров
-    # (тот придёт отдельным notify_open/notify_error чуть позже).
+    # (тот придёт отдельным notify_open/notify_error чуть позже). НЕ
+    # дублируется в @Depositik (осознанно, 2026-09-10) — слишком частая
+    # (десятки в час), пользователь явно попросил дублировать только
+    # важное (ошибки/вход/выход); сам факт входа всё равно продублирован
+    # отдельно через notify_open чуть позже.
     # -------------------------------------------------------------------
     def notify_auto_trade_trigger(self, *, symbol: str, spread_percent, amount_usdt: float) -> None:
         text = (
@@ -182,6 +198,13 @@ class TelegramNotifier:
     # 🔍 НАЙДЕНА СВЯЗКА (сканер рынка, scanner.py) — HTML с моноширинным
     # блоком <pre>, поэтому явно просим parse_mode='html' (а не дефолтный
     # markdown, который используют остальные notify_* методы выше).
+    # НЕ дублируется в @Depositik (осознанно, 2026-09-10) — пользователь
+    # спросил "мне не приходят уведомления сканера" (они честно
+    # отправлялись, просто не туда, куда он смотрит), но при ~29 находках
+    # за цикл (~сотни в час) дублирование ВСЕХ в активный чат было бы
+    # спамом — по явной просьбе пользователя дублируем только важное
+    # (notify_error/notify_open/notify_close/notify_test_position_closed/
+    # notify_test_batch_summary), эта осталась в "me".
     # -------------------------------------------------------------------
     def notify_scan_alert(self, html: str) -> None:
         self._dispatch(html, parse_mode="html")
@@ -223,7 +246,7 @@ class TelegramNotifier:
             f"• Статус тестов: [{closed_count} / {total_count} closed]"
         )
         html = f"<pre>{_html_escape(body)}</pre>"
-        self._dispatch(html, parse_mode="html", recipients=("me", "@Depositik"))
+        self._dispatch(html, parse_mode="html", recipients=("me", "@Depositik", "@G_Pobedonosec"))
 
     # -------------------------------------------------------------------
     # 📊 ФИНАЛЬНЫЙ ОТЧЁТ ПО ТЕСТОВОЙ СЕРИИ — когда все N сделок закрыты
@@ -251,4 +274,37 @@ class TelegramNotifier:
             f"Убыточных: {losses} ({100 - win_rate_pct:.1f}%)"
         )
         html = f"🏁 <b>Итоговый отчёт тестовой серии</b>\n<pre>{_html_escape(body)}</pre>"
-        self._dispatch(html, parse_mode="html")
+        self._dispatch(html, parse_mode="html", recipients=("me", "@Depositik", "@G_Pobedonosec"))
+
+    # -------------------------------------------------------------------
+    # 📅 ЕЖЕДНЕВНЫЙ ОТЧЁТ — добавлено 2026-09-12 по прямой просьбе
+    # пользователя ("отчёт по задержкам на ноги и какой +пнл за сутки" на
+    # @Depositik/@G_Pobedonosec) — см. trade_ledger.daily_stats и
+    # scanner.py:_daily_report_loop (шлётся один раз в сутки, вскоре после
+    # полуночи UTC, за ПРОШЕДШИЕ сутки).
+    # -------------------------------------------------------------------
+    def notify_daily_report(
+        self,
+        *,
+        date_str: str,
+        opens_count: int,
+        closes_count: int,
+        avg_open_latency_ms,
+        avg_close_latency_ms,
+        total_net_pnl: float,
+        wins: int,
+        losses: int,
+    ) -> None:
+        def _latency(ms) -> str:
+            return f"{ms:.0f} мс" if ms is not None else "н/д"
+
+        body = (
+            f"📅 ЕЖЕДНЕВНЫЙ ОТЧЁТ — {date_str} (UTC)\n"
+            f"\n"
+            f"Открытий: {opens_count} (средняя задержка между ногами: {_latency(avg_open_latency_ms)})\n"
+            f"Закрытий: {closes_count} (средняя задержка между ногами: {_latency(avg_close_latency_ms)})\n"
+            f"Прибыльных: {wins} / Убыточных: {losses}\n"
+            f"Итоговый PnL за сутки: {total_net_pnl:+.4f}$"
+        )
+        html = f"📅 <b>Ежедневный отчёт</b>\n<pre>{_html_escape(body)}</pre>"
+        self._dispatch(html, parse_mode="html", recipients=("me", "@Depositik", "@G_Pobedonosec"))

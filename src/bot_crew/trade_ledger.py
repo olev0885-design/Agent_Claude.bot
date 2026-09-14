@@ -63,6 +63,52 @@ def read_all() -> list:
     return trades
 
 
+def daily_stats(target_date=None, trades: "list | None" = None) -> dict:
+    """Сводка ЗА ОДНИ КОНКРЕТНЫЕ СУТКИ (UTC) — по прямой просьбе
+    пользователя 2026-09-12 ("отчёт по задержкам на ноги и какой +пнл за
+    сутки", ежедневная рассылка в @Depositik/@G_Pobedonosec, см.
+    scanner.py:_daily_report_loop). target_date — datetime.date, по
+    умолчанию сегодня (UTC). Различает событие "open" (см. _finalize_open
+    в trade_executor.py — elapsed_ms там — это задержка МЕЖДУ НОГАМИ при
+    ОТКРЫТИИ) от обычных записей закрытых сделок (elapsed_ms там — это
+    задержка между ногами при ЗАКРЫТИИ, см. _finalize_close) — старые
+    записи журнала (до 2026-09-12) не имеют поля "event" вообще, для них
+    считаем это закрытием (все записи ДО этой даты — именно закрытия,
+    "open" начали писать только сейчас)."""
+    if trades is None:
+        trades = read_all()
+    if target_date is None:
+        target_date = datetime.now(timezone.utc).date()
+
+    def _entry_date(entry: dict):
+        ts = entry.get("closed_at") or entry.get("opened_at") or entry.get("recorded_at")
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts).date()
+        except (TypeError, ValueError):
+            return None
+
+    todays = [t for t in trades if _entry_date(t) == target_date]
+    opens = [t for t in todays if t.get("event") == "open"]
+    closes = [t for t in todays if t.get("event") != "open"]
+
+    open_latencies = [t["elapsed_ms"] for t in opens if t.get("elapsed_ms") is not None]
+    close_latencies = [t["elapsed_ms"] for t in closes if t.get("elapsed_ms") is not None]
+    net_pnls = [t["net_pnl"] for t in closes if t.get("net_pnl") is not None]
+
+    return {
+        "date": target_date.isoformat(),
+        "opens_count": len(opens),
+        "closes_count": len(closes),
+        "avg_open_latency_ms": (sum(open_latencies) / len(open_latencies)) if open_latencies else None,
+        "avg_close_latency_ms": (sum(close_latencies) / len(close_latencies)) if close_latencies else None,
+        "total_net_pnl": sum(net_pnls) if net_pnls else 0.0,
+        "wins": len([p for p in net_pnls if p > 0]),
+        "losses": len([p for p in net_pnls if p <= 0]),
+    }
+
+
 def summary_stats(trades: "list | None" = None) -> dict:
     """Быстрая сводка по журналу — win-rate, средний/суммарный net PnL и
     т.п. Удобно для отчётов вроде "дай отчёт по пнл" — раньше это

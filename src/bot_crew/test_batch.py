@@ -41,6 +41,15 @@ class TestBatchPosition:
     # ставку не удалось узнать — тогда сравниваем по gross PnL (без
     # поправки на комиссии, см. _monitor_test_batch).
     entry_fee_total: "float | None" = None
+    # ШИРОКИЙ ВХОД БЕЗ ИСТОРИИ СХОЖДЕНИЯ (добавлено 2026-09-11 по явной
+    # просьбе пользователя после реального случая STORJ — см. подробный
+    # комментарий в scanner.py:_handle_test_batch_opportunity) — True,
+    # если позиция открыта, несмотря на то что спред этой пары бирж НИ
+    # РАЗУ не опускался до "сходящегося" уровня за lookback-окно.
+    # scanner.py:_monitor_test_batch применяет к таким позициям
+    # ДОПОЛНИТЕЛЬНУЮ защиту (максимальное время удержания + стоп-лосс),
+    # которой нет у обычных, исторически сходящихся монет.
+    wide_spread: bool = False
 
 
 @dataclass
@@ -89,7 +98,28 @@ class TestBatchTracker:
         а не текущее количество ОТКРЫТЫХ (то падает по мере закрытия)."""
         return len(self.open_positions) + len(self.closed_trades)
 
+    @property
+    def unlimited(self) -> bool:
+        """size <= 0 означает РЕЖИМ БЕЗ ЛИМИТА — бот работает непрерывно,
+        серия никогда не "заполняется" и никогда не переходит в DONE.
+
+        Добавлено 2026-09-13 по прямой просьбе пользователя ("выйти с
+        тестовой линии, тесты прошли, теперь нужно выходить в прибыль").
+        ВАЖНО, почему сделано именно так, а не выключением TEST_BATCH_MODE:
+        ВЕСЬ мониторинг открытых позиций и логика закрытия живут внутри
+        этого трекера (scanner.py:_position_monitor_loop следит ровно за
+        self.open_positions и останавливается навсегда при state == DONE).
+        Если просто выключить тестовый режим, позиции начали бы
+        открываться другим путём (_trigger_trade) и НИКОГДА не
+        закрывались бы автоматически — вместе со всей накопленной защитой
+        (проверка прибыли перед закрытием, буфер комиссий, правила для
+        wide_spread). Поэтому "выход из тестов" = снятие лимита на
+        количество сделок, а не отключение самого движка."""
+        return self.size <= 0
+
     def can_open_more(self) -> bool:
+        if self.unlimited:
+            return self.state == PROSPECTING
         return self.state == PROSPECTING and self.opened_count < self.size
 
     def record_open(
@@ -104,6 +134,7 @@ class TestBatchTracker:
         short_entry_price: float,
         amount_usdt: float,
         entry_fee_total: "float | None" = None,
+        wide_spread: bool = False,
     ) -> None:
         """Регистрирует УСПЕШНО открытую позицию серии. Если это была
         `size`-я по счёту — сразу переключает состояние в MONITORING,
@@ -121,8 +152,11 @@ class TestBatchTracker:
             short_entry_price=short_entry_price,
             amount_usdt=amount_usdt,
             entry_fee_total=entry_fee_total,
+            wide_spread=wide_spread,
         )
-        if self.opened_count >= self.size:
+        # В режиме без лимита (см. unlimited) серия НИКОГДА не считается
+        # заполненной — бот продолжает искать новые связки бесконечно.
+        if not self.unlimited and self.opened_count >= self.size:
             self.state = MONITORING
 
     def record_close(
@@ -158,7 +192,10 @@ class TestBatchTracker:
         )
         self.closed_trades.append(trade)
 
-        if not self.open_positions and self.opened_count >= self.size:
+        # В режиме без лимита DONE не наступает никогда — иначе
+        # scanner.py:_position_monitor_loop навсегда остановил бы
+        # мониторинг открытых позиций (см. комментарий у unlimited).
+        if not self.unlimited and not self.open_positions and self.opened_count >= self.size:
             self.state = DONE
 
         return trade
