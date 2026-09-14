@@ -14,6 +14,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 
 # На Windows консоль по умолчанию использует кодировку вроде cp1251, которая
 # не умеет печатать эмодзи (например, 🚨 из тестового сигнала ниже) и падает
@@ -256,6 +257,18 @@ def listen() -> None:
         "bot_session",
         int(os.getenv("TELEGRAM_API_ID")),
         os.getenv("TELEGRAM_API_HASH"),
+        # connection_retries=None — БЕСКОНЕЧНЫЕ попытки переподключения
+        # (добавлено 2026-09-15 после трёх тихих остановок бота за сутки).
+        # По умолчанию Telethon сдаётся после 5 попыток; после сна ноутбука
+        # (журнал Windows: 23:24:33 «переход в спящий режим», последний
+        # heartbeat 23:24:16) сокеты мёртвы, пять попыток не проходят,
+        # run_until_disconnected() ВОЗВРАЩАЕТСЯ — и listen() тихо
+        # завершается кодом 0: ни Traceback, ни строки в stderr. Бот
+        # просто «заканчивался». Телеграм для нас — не причина умирать:
+        # сканер, мониторинг и ордера от него не зависят.
+        connection_retries=None,
+        retry_delay=2,
+        auto_reconnect=True,
     )
 
     # notifier шлёт мгновенные алерты о входе/выходе/ошибках прямо из
@@ -447,6 +460,9 @@ def listen() -> None:
             int(os.getenv("TELEGRAM_API_ID")),
             os.getenv("TELEGRAM_API_HASH"),
             loop=client.loop,
+            connection_retries=None,  # см. комментарий у основного client
+            retry_delay=2,
+            auto_reconnect=True,
         )
 
         async def skyspreads_handler(event):
@@ -479,6 +495,23 @@ def listen() -> None:
                 print(f"Не удалось отправить отчёт в Telegram: {exc}")
 
         skyspreads_client.add_event_handler(skyspreads_handler, events.NewMessage(chats=skyspreads_channel_id))
+
+    # НЕ ДАВАТЬ WINDOWS УСНУТЬ ПО БЕЗДЕЙСТВИЮ, пока бот работает (2026-09-15).
+    # SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) — штатный
+    # способ, которым плееры и загрузчики держат систему бодрой; прав
+    # администратора не требует. От закрытия крышки и ручного «Сон» это НЕ
+    # спасает — на это бот повлиять не может, только пережить (см.
+    # супервизор ниже). Ошибка здесь не критична — просто логируем.
+    if os.name == "nt":
+        try:
+            import ctypes
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+            if ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED):
+                print("[startup] Сон Windows по бездействию заблокирован на время работы бота.")
+            else:
+                print("[startup] Не удалось заблокировать сон по бездействию (SetThreadExecutionState вернул 0).")
+        except Exception as exc:
+            print(f"[startup] Не удалось заблокировать сон по бездействию: {exc}")
 
     client.start(os.getenv("TELEGRAM_PHONE"))
 
@@ -534,7 +567,51 @@ def listen() -> None:
     except Exception as exc:
         print(f"[startup] Не удалось отправить уведомление о рестарте: {exc}")
 
-    client.run_until_disconnected()
+    # =========================================================================
+    # ПРОЦЕСС НЕ ИМЕЕТ ПРАВА ЗАВЕРШИТЬСЯ ИЗ-ЗА TELEGRAM (добавлено 2026-09-15).
+    #
+    # Раньше здесь была одна строка client.run_until_disconnected(). Она
+    # возвращается, когда Telethon окончательно теряет связь, — и на этом
+    # listen() заканчивался, а вместе с ним умирали сканер, мониторинг
+    # открытых позиций и сверка. Без единой ошибки в логе: процесс просто
+    # выходил с кодом 0. Так бот тихо остановился трижды за 14.09 — каждый
+    # раз ровно после короткого сна ноутбука (журнал Windows, Kernel-Power 42).
+    #
+    # Теперь: если run_until_disconnected() вернулся — переподключаемся и
+    # входим в него снова, бесконечно. Пока loop не крутится (между обрывом
+    # и переподключением), задачи сканера стоят на паузе — это секунды, и
+    # это несравнимо лучше, чем бот, которого нет. После восстановления
+    # шлём в Telegram пометку, чтобы было видно: связь рвалась.
+    # =========================================================================
+    _reconnect_delay = 5.0
+    while True:
+        try:
+            client.run_until_disconnected()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            print(f"[main] run_until_disconnected завершился ошибкой: {type(exc).__name__}: {exc}")
+        print(f"[main] Telegram отключён — бот НЕ завершается, переподключаюсь через {_reconnect_delay:.0f}с.")
+        time.sleep(_reconnect_delay)
+        try:
+            if not client.is_connected():
+                client.loop.run_until_complete(client.connect())
+            if skyspreads_client is not None and not skyspreads_client.is_connected():
+                client.loop.run_until_complete(skyspreads_client.connect())
+            print("[main] Telegram переподключён — продолжаю.")
+            # notifier планирует отправку на loop — она уйдёт сразу, как только
+            # loop снова закрутится внутри run_until_disconnected() ниже.
+            try:
+                notifier.notify_error(
+                    symbol="СВЯЗЬ",
+                    error_message="Соединение с Telegram обрывалось (сон ПК/сеть) — бот пережил обрыв и работает дальше.",
+                )
+            except Exception:
+                pass
+            _reconnect_delay = 5.0
+        except Exception as exc:
+            print(f"[main] переподключение не удалось ({type(exc).__name__}: {exc}) — повторю через {_reconnect_delay:.0f}с.")
+            _reconnect_delay = min(_reconnect_delay * 2, 60.0)
 
 
 def main() -> None:

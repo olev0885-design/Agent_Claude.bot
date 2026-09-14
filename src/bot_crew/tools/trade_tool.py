@@ -186,6 +186,21 @@ def _extract_ticker_price(ticker: dict):
     return None
 
 
+def _timings_total_ms(timings: dict) -> float:
+    """Сумма ТОЛЬКО числовых полей *_ms. Раньше здесь было sum(timings.values())
+    — и 2026-09-15 это стоило реальных денег: в словарь замеров добавили
+    строковое поле book_source ("поток/поток"), sum() упал на int + str
+    УЖЕ ПОСЛЕ того, как обе ноги BONER исполнились на биржах. Исключение
+    вылетело из открытия, позиция не попала в учёт, reconcile закрыл обе
+    ноги как «неучтённые», сканер зашёл снова — и так три круга комиссий
+    подряд. Замер задержки не имеет права влиять на судьбу сделки, а
+    подсчёт суммы — знать, какие ещё поля кто-то положит в словарь."""
+    return round(
+        sum(v for k, v in timings.items() if k.endswith("_ms") and isinstance(v, (int, float)) and not isinstance(v, bool)),
+        1,
+    )
+
+
 async def _verify_order_filled(
     exchange, order: dict, symbol: str, exchange_id: str, exchange_name: str = None
 ) -> dict:
@@ -2397,26 +2412,35 @@ class TradeExecutionTool(BaseTool):
             leg_result["taker_fee_rate"] = fee_rate
             leg_result["fee_usdt"] = amount_usdt * fee_rate if fee_rate is not None else None
 
-        timings["fee_lookup_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
-        timings["total_ms"] = round(sum(timings.values()), 1)
-        # ПОМЕТКА О ПРЕДСТАВИТЕЛЬНОСТИ ЗАМЕРА (добавлено 2026-09-14 по
-        # прямой просьбе пользователя после разбора артефакта): у боевого
-        # входа стакан приходит готовым из early-spread-check сканера, а у
-        # любого вызова в обход сканера (тестовый скрипт, сигнал канала) —
-        # запрашивается тут же и стоит ~1.5с. Числа при этом выглядят
-        # одинаково, и один раз я уже сравнил боевой путь с синтетическим,
-        # не заметив разницы. Теперь строка сама говорит, что это было.
-        reused = timings.get("book_snapshot_reused")
-        book_source = timings.get("book_source")
-        source = (
-            f"стакан ГОТОВЫЙ из сканера, источник {book_source}" if reused
-            else "стакан ЗАПРОШЕН здесь — НЕ боевой путь"
-        )
-        print(
-            f"[timing] {coin.upper()} ОТКРЫТИЕ: стакан {timings.get('book_snapshot_ms', 0)}мс ({source}) + "
-            f"проверки {timings.get('pre_order_checks_ms', 0)}мс + ордера {timings.get('orders_ms', 0)}мс + "
-            f"комиссии {timings.get('fee_lookup_ms', 0)}мс = {timings['total_ms']}мс всего"
-        )
+        # С ЭТОГО МЕСТА ОБЕ НОГИ УЖЕ ОТКРЫТЫ НА БИРЖАХ. Всё ниже — учёт и
+        # косметика; ни одна ошибка здесь не имеет права превратить факт
+        # «позиция открыта» в исключение «сделка не удалась» (реальный
+        # инцидент BONER 2026-09-15, см. _timings_total_ms). Поэтому —
+        # в try/except с громким логом, но с обязательным return результата.
+        try:
+            timings["fee_lookup_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
+            timings["total_ms"] = _timings_total_ms(timings)
+            # ПОМЕТКА О ПРЕДСТАВИТЕЛЬНОСТИ ЗАМЕРА (добавлено 2026-09-14 по
+            # прямой просьбе пользователя после разбора артефакта): у боевого
+            # входа стакан приходит готовым из early-spread-check сканера, а у
+            # любого вызова в обход сканера (тестовый скрипт, сигнал канала) —
+            # запрашивается тут же и стоит ~1.5с. Числа при этом выглядят
+            # одинаково, и один раз я уже сравнил боевой путь с синтетическим,
+            # не заметив разницы. Теперь строка сама говорит, что это было.
+            reused = timings.get("book_snapshot_reused")
+            book_source = timings.get("book_source")
+            source = (
+                f"стакан ГОТОВЫЙ из сканера, источник {book_source}" if reused
+                else "стакан ЗАПРОШЕН здесь — НЕ боевой путь"
+            )
+            print(
+                f"[timing] {coin.upper()} ОТКРЫТИЕ: стакан {timings.get('book_snapshot_ms', 0)}мс ({source}) + "
+                f"проверки {timings.get('pre_order_checks_ms', 0)}мс + ордера {timings.get('orders_ms', 0)}мс + "
+                f"комиссии {timings.get('fee_lookup_ms', 0)}мс = {timings['total_ms']}мс всего"
+            )
+        except Exception as exc:
+            timings.setdefault("total_ms", 0.0)
+            print(f"[timing] {coin.upper()}: ошибка подсчёта замеров ({type(exc).__name__}: {exc}) — на сделку НЕ влияет.")
 
         return {
             "coin": coin.upper(),
@@ -2834,12 +2858,18 @@ class TradeExecutionTool(BaseTool):
                 else None
             )
 
-        timings["fee_lookup_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
-        timings["total_ms"] = round(sum(timings.values()), 1)
-        print(
-            f"[timing] {coin.upper()} ЗАКРЫТИЕ: ордера {timings['orders_ms']}мс + "
-            f"комиссии {timings['fee_lookup_ms']}мс = {timings['total_ms']}мс всего"
-        )
+        # См. комментарий в _open_both_legs_async: ноги уже закрыты на биржах,
+        # ошибка подсчёта замеров не должна ронять результат закрытия.
+        try:
+            timings["fee_lookup_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
+            timings["total_ms"] = _timings_total_ms(timings)
+            print(
+                f"[timing] {coin.upper()} ЗАКРЫТИЕ: ордера {timings['orders_ms']}мс + "
+                f"комиссии {timings['fee_lookup_ms']}мс = {timings['total_ms']}мс всего"
+            )
+        except Exception as exc:
+            timings.setdefault("total_ms", 0.0)
+            print(f"[timing] {coin.upper()}: ошибка подсчёта замеров закрытия ({type(exc).__name__}: {exc}) — на сделку НЕ влияет.")
 
         return {
             "coin": coin.upper(),

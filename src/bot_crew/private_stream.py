@@ -80,6 +80,13 @@ _MAX_REMEMBERED_ORDERS = 500
 # переподключений к MEXC, который фьючерсный стакан не отдаёт вовсе).
 _MAX_CONSECUTIVE_FAILURES = 3
 
+# Через сколько секунд после того, как ВСЕ насосы биржи сдались, разрешаем
+# подписаться заново. Добавлено 2026-09-15: после сна ноутбука сеть
+# возвращается не сразу, три попытки с паузой 2с проходят впустую, и без
+# этого биржа оставалась бы на REST до следующего рестарта — то есть
+# выигрыш от потоков тихо терялся на часы.
+_RETRY_AFTER_GIVE_UP_SECONDS = 600.0
+
 
 def _enabled() -> bool:
     return os.getenv("PRIVATE_STREAM_ENABLED", "True").lower() == "true"
@@ -199,6 +206,7 @@ async def _positions_pump(exchange_name: str, exchange) -> None:
                 state["seeded"] = False
                 if failures >= _MAX_CONSECUTIVE_FAILURES:
                     state["positions_gave_up"] = True
+                    state["gave_up_at"] = time.monotonic()
                     print(
                         f"[private-stream] {exchange_name}: поток позиций не поднялся "
                         f"{failures} раз ({type(exc).__name__}) — остаюсь на REST."
@@ -243,6 +251,7 @@ async def _orders_pump(exchange_name: str, exchange) -> None:
             if failures >= _MAX_CONSECUTIVE_FAILURES:
                 if state is not None:
                     state["orders_gave_up"] = True
+                    state["gave_up_at"] = time.monotonic()
                 print(
                     f"[private-stream] {exchange_name}: поток ордеров не поднялся "
                     f"{failures} раз ({type(exc).__name__}) — остаюсь на REST."
@@ -266,8 +275,17 @@ async def subscribe(exchange_name: str, build_client) -> None:
     trade_tool.TradeExecutionTool), чтобы весь разбор учётных данных,
     passphrase, обход подписи Aster и demo-домены жили в ОДНОМ месте и не
     разъезжались с боевым путём ордеров."""
-    if not _enabled() or exchange_name in _STREAMS or exchange_name in _FAILED:
+    if not _enabled() or exchange_name in _FAILED:
         return
+    existing = _STREAMS.get(exchange_name)
+    if existing is not None:
+        gave_up_at = existing.get("gave_up_at")
+        all_done = all(t.done() for t in existing.get("tasks", [])) if existing.get("tasks") else True
+        if gave_up_at and all_done and time.monotonic() - gave_up_at > _RETRY_AFTER_GIVE_UP_SECONDS:
+            print(f"[private-stream] {exchange_name}: прошло {_RETRY_AFTER_GIVE_UP_SECONDS:.0f}с после отказа — пробую подписаться снова.")
+            await unsubscribe(exchange_name)
+        else:
+            return
     exchange_id = None
     try:
         exchange = build_client()
