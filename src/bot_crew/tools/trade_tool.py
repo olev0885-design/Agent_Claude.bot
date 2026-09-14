@@ -31,6 +31,9 @@ from bot_crew import blocked_coins_store
 # ордера (см. _verify_order_filled); при любом сбое потока путь
 # полностью откатывается на прежние REST-проверки.
 from bot_crew import private_stream
+# См. book_stream.py — потоковые стаканы; _get_book_snapshot сначала
+# смотрит туда и лишь при отсутствии/устаревании идёт по REST.
+from bot_crew import book_stream
 
 
 # =============================================================================
@@ -1732,10 +1735,31 @@ class TradeExecutionTool(BaseTool):
         Возвращает None при любой ошибке (сеть, символ не найден, пустой
         стакан) — вызывающий код тогда пропускает и направление-, и
         spread-проверку, как и раньше при сетевых сбоях (fail-open)."""
+        # СНАЧАЛА — ПОТОКОВЫЙ СТАКАН (добавлено 2026-09-14 по прямой просьбе
+        # пользователя "можем ли всё сделать на веб-сокете, чтобы быстрее").
+        # Если сканер уже держит подписку на эту пару (открытая позиция или
+        # КАНДИДАТ на вход — см. scanner.py:_note_book_candidates), книга
+        # лежит в памяти и читается за 0мс вместо 282-2859мс REST (медиана
+        # ~540мс по [timing]). get_book сам отдаёт None, если поток молчит
+        # дольше BOOK_STREAM_MAX_AGE_SECONDS или книга пустая — тогда
+        # честно идём по REST ниже, торговая логика не меняется.
+        symbol = _build_symbol(exchange_name, coin)
+        exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+        streamed = book_stream.get_book(exchange_id, symbol)
+        if streamed is not None:
+            bids, asks = streamed.get("bids"), streamed.get("asks")
+            if bids and asks and bids[0] and asks[0]:
+                best_bid, best_ask = bids[0][0], asks[0][0]
+                return {
+                    "reference_price": (best_bid + best_ask) / 2 if best_bid and best_ask else None,
+                    "buy_vwap": self._vwap_from_levels(asks, amount_usdt),
+                    "sell_vwap": self._vwap_from_levels(bids, amount_usdt),
+                    "source": "поток",
+                }
+
         exchange = None
         try:
             exchange = await self._get_ready_client(exchange_name)
-            symbol = _build_symbol(exchange_name, coin)
             if symbol not in exchange.markets:
                 await exchange.load_markets(True)
                 _warm_markets_cache[EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())] = exchange.markets
@@ -1762,6 +1786,7 @@ class TradeExecutionTool(BaseTool):
                 "reference_price": reference_price,
                 "buy_vwap": self._vwap_from_levels(asks, amount_usdt),   # LONG (покупка) — идём по asks
                 "sell_vwap": self._vwap_from_levels(bids, amount_usdt),  # SHORT (продажа) — идём по bids
+                "source": "REST",
             }
         except Exception as exc:
             # Раньше здесь была ТИХАЯ отмена (return None без единой
@@ -1912,6 +1937,12 @@ class TradeExecutionTool(BaseTool):
                     self._get_free_balance(short_exchange),
                 )
                 timings["book_snapshot_reused"] = True
+                # Откуда сканер взял эти книги — из потока (0мс) или по REST.
+                # Пишем в timings, чтобы журнал сделок сам показывал, сработал
+                # ли потоковый стакан для кандидатов на РЕАЛЬНОМ входе.
+                timings["book_source"] = "/".join(
+                    (b or {}).get("source", "?") for b in (long_snapshot, short_snapshot)
+                )
             else:
                 long_snapshot, short_snapshot, long_balance, short_balance = await asyncio.gather(
                     self._get_book_snapshot(long_exchange, coin, amount_usdt),
@@ -2376,7 +2407,11 @@ class TradeExecutionTool(BaseTool):
         # одинаково, и один раз я уже сравнил боевой путь с синтетическим,
         # не заметив разницы. Теперь строка сама говорит, что это было.
         reused = timings.get("book_snapshot_reused")
-        source = "стакан ГОТОВЫЙ из сканера" if reused else "стакан ЗАПРОШЕН здесь — НЕ боевой путь"
+        book_source = timings.get("book_source")
+        source = (
+            f"стакан ГОТОВЫЙ из сканера, источник {book_source}" if reused
+            else "стакан ЗАПРОШЕН здесь — НЕ боевой путь"
+        )
         print(
             f"[timing] {coin.upper()} ОТКРЫТИЕ: стакан {timings.get('book_snapshot_ms', 0)}мс ({source}) + "
             f"проверки {timings.get('pre_order_checks_ms', 0)}мс + ордера {timings.get('orders_ms', 0)}мс + "

@@ -40,6 +40,16 @@ import ccxt.pro as ccxt_pro
 # (exchange_id, symbol) -> {"task": Task, "exchange": client, "book": dict, "ts": monotonic}
 _STREAMS: dict = {}
 
+# exchange_id -> monotonic, до которого НЕ пытаемся подписываться на этой
+# бирже вовсе. Ставится, когда поток по любой паре биржи сдался после
+# _MAX_CONSECUTIVE_FAILURES попыток. Смысл появился вместе с подписками на
+# КАНДИДАТОВ (scanner.py:_note_book_candidates, 2026-09-14): пары приходят
+# и уходят каждые несколько минут, и без этой паузы MEXC — единственная
+# биржа, которая фьючерсный стакан по WebSocket не отдаёт, — на каждого
+# нового кандидата снова тратила бы ~6с попыток и три строки в лог.
+_EXCHANGE_COOLOFF_UNTIL: dict = {}
+_EXCHANGE_COOLOFF_SECONDS = 1800.0
+
 
 def _enabled() -> bool:
     return os.getenv("BOOK_STREAM_ENABLED", "True").lower() == "true"
@@ -98,6 +108,7 @@ async def _pump(key, exchange, symbol: str) -> None:
                 entry = _STREAMS.get(key)
                 if entry is not None:
                     entry["gave_up"] = True
+                _EXCHANGE_COOLOFF_UNTIL[key[0]] = time.monotonic() + _EXCHANGE_COOLOFF_SECONDS
                 return
             print(f"[book-stream] {key[0]}/{symbol}: обрыв потока ({type(exc).__name__}) — переподключаюсь ({failures}/{_MAX_CONSECUTIVE_FAILURES}).")
             await asyncio.sleep(2.0)
@@ -113,6 +124,8 @@ async def subscribe(exchange_id: str, symbol: str, config: dict) -> None:
     key = (exchange_id, symbol)
     if key in _STREAMS:
         return
+    if time.monotonic() < _EXCHANGE_COOLOFF_UNTIL.get(exchange_id, 0.0):
+        return  # биржа недавно доказала, что поток не отдаёт — тихо остаёмся на REST
     cls = getattr(ccxt_pro, exchange_id, None)
     if cls is None:
         return  # биржа не поддерживается ccxt.pro — молча работаем по REST

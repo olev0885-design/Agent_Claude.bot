@@ -247,6 +247,15 @@ class FundingScanner:
         self._clock_ok: bool = True
         self._clock_last_alert_at: float = 0.0
 
+        # КАНДИДАТЫ НА ПОТОКОВЫЙ СТАКАН (см. _note_book_candidates /
+        # _sync_book_streams): (exchange_id, symbol) -> monotonic, когда
+        # пару последний раз видели среди связок близко к порогу входа.
+        # Подписка живёт BOOK_STREAM_CANDIDATE_TTL_SECONDS после последнего
+        # появления — иначе пара, мелькающая через цикл, подписывалась и
+        # отписывалась бы каждые 14 секунд, а WebSocket поднимается 2-10с,
+        # и к моменту входа книги в памяти всё равно не было бы.
+        self._book_candidates: dict = {}
+
         # РАЗОВОЕ ИСКЛЮЧЕНИЕ из правила "1 нога на биржу" (см.
         # busy_exchanges выше) — по явной просьбе пользователя 2026-09-08:
         # "разрешаю сделать разовое исключение для mexc и gate, но только 1
@@ -488,6 +497,15 @@ class FundingScanner:
                     # это чистая подготовка на будущее, она не должна ни на
                     # миллисекунду задерживать текущий цикл или сделку.
                     asyncio.create_task(self._warm_leverage_for_candidates(opportunities))
+                    # ПОТОКОВЫЙ СТАКАН ДЛЯ КАНДИДАТОВ (добавлено 2026-09-14 по
+                    # прямой просьбе пользователя "можем ли всё сделать на
+                    # веб-сокете") — тот же принцип, что и прогрев плеча:
+                    # заранее подписываемся на стаканы монет, в которые
+                    # реально можем зайти, чтобы вход читал книгу из памяти
+                    # (0мс) вместо REST (~540мс). Сама подписка — в
+                    # _sync_book_streams, здесь только отмечаем кандидатов.
+                    self._note_book_candidates(opportunities)
+                    asyncio.create_task(self._sync_book_streams())
                 except asyncio.TimeoutError:
                     print(
                         f"[scanner] Цикл сканирования не уложился в "
@@ -2289,11 +2307,42 @@ class FundingScanner:
                 if done >= limit:
                     break
 
+    def _note_book_candidates(self, opportunities: list) -> None:
+        """Отмечает пары, на которые стоит держать потоковый стакан ЗАРАНЕЕ:
+        связки со спредом не ниже (порог входа − BOOK_STREAM_CANDIDATE_
+        MARGIN_PCT) на разрешённых биржах, не больше BOOK_STREAM_CANDIDATE_
+        MAX пар за цикл (в порядке убывания спреда — самые близкие к входу
+        первыми). Запас ниже порога нужен намеренно: связка на 2.3% через
+        цикл станет 2.6%, и подписка к этому моменту должна уже работать."""
+        if not opportunities or self.test_batch is None:
+            return
+        margin = _get_float_env("BOOK_STREAM_CANDIDATE_MARGIN_PCT", 0.5)
+        limit = _get_int_env("BOOK_STREAM_CANDIDATE_MAX", 6)
+        threshold = self.test_batch.min_spread_pct - margin
+        now = time.monotonic()
+        taken = 0
+        for opp in sorted(opportunities, key=lambda o: o.get("spread_pct", 0), reverse=True):
+            if taken >= limit:
+                break
+            if opp.get("spread_pct", 0) < threshold:
+                break  # список отсортирован — дальше только меньше
+            long_ex, short_ex = (opp.get("long_exchange") or "").lower(), (opp.get("short_exchange") or "").lower()
+            if long_ex not in self.test_batch_safe_exchanges or short_ex not in self.test_batch_safe_exchanges:
+                continue
+            if not opp.get("long_symbol") or not opp.get("short_symbol"):
+                continue
+            self._book_candidates[(EXCHANGE_ALIASES.get(long_ex, long_ex), opp["long_symbol"])] = now
+            self._book_candidates[(EXCHANGE_ALIASES.get(short_ex, short_ex), opp["short_symbol"])] = now
+            taken += 1
+
     async def _sync_book_streams(self) -> None:
-        """Держит набор потоковых подписок в точности равным набору ног
-        ОТКРЫТЫХ позиций серии: новая позиция — подписались, закрылась —
-        отписались. Вызывается из цикла мониторинга (дёшево: сравнение
-        двух множеств, реальные действия только при изменениях).
+        """Держит набор потоковых подписок равным объединению двух множеств:
+        (1) ноги ОТКРЫТЫХ позиций серии — для пути закрытия, и (2)
+        КАНДИДАТЫ на вход (см. _note_book_candidates), не старше
+        BOOK_STREAM_CANDIDATE_TTL_SECONDS — для пути открытия. Новая пара —
+        подписались, выпала из обоих множеств — отписались. Вызывается из
+        цикла мониторинга и сразу после каждого скана (дёшево: сравнение
+        множеств, реальные действия только при изменениях).
 
         Публичный стакан не требует ключей, поэтому клиенту потока хватает
         минимального конфига — ключи сюда СОЗНАТЕЛЬНО не передаются."""
@@ -2303,6 +2352,13 @@ class FundingScanner:
         for pos in self.test_batch.open_positions.values():
             want.add((EXCHANGE_ALIASES.get(pos.long_exchange.lower(), pos.long_exchange.lower()), pos.long_symbol))
             want.add((EXCHANGE_ALIASES.get(pos.short_exchange.lower(), pos.short_exchange.lower()), pos.short_symbol))
+        ttl = _get_float_env("BOOK_STREAM_CANDIDATE_TTL_SECONDS", 180.0)
+        now = time.monotonic()
+        for key, seen_at in list(self._book_candidates.items()):
+            if now - seen_at > ttl:
+                del self._book_candidates[key]
+            else:
+                want.add(key)
         have = set()
         for item in book_stream.active_streams():
             ex_id, _, sym = item.partition("/")
