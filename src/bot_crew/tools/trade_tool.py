@@ -34,6 +34,9 @@ from bot_crew import private_stream
 # См. book_stream.py — потоковые стаканы; _get_book_snapshot сначала
 # смотрит туда и лишь при отсутствии/устаревании идёт по REST.
 from bot_crew import book_stream
+# См. _persist_provisional_position — запись позиции в учёт СРАЗУ после
+# исполнения обеих ног, до любой косметики (инцидент BONER 2026-09-15).
+from bot_crew import position_store
 
 
 # =============================================================================
@@ -184,6 +187,52 @@ def _extract_ticker_price(ticker: dict):
     if bid and ask:
         return (bid + ask) / 2
     return None
+
+
+def _persist_provisional_position(
+    coin: str, long_exchange: str, short_exchange: str,
+    long_result: dict, short_result: dict, amount_usdt: float, leverage: int,
+) -> None:
+    """ПЕРВОЕ действие после того, как ОБЕ ноги реально исполнились: кладём
+    позицию в position_store с тем минимумом, что уже известен (биржи,
+    объёмы, цены исполнения, id ордеров). Всё, что бот делает дальше —
+    комиссии, замеры, отчёт, Telegram — это обработка УЖЕ СЛУЧИВШЕГОСЯ, и
+    ни одна ошибка там не должна оставить открытые ноги без учёта.
+
+    Зачем (реальный инцидент BONER 2026-09-15, -0.82 USDT): раньше запись
+    делалась в trade_executor._finalize_open ПОСЛЕ подсчёта задержек и
+    сборки отчёта; исключение в подсчёте (int + str) вылетало до записи,
+    позиция «терялась», сверка закрывала обе ноги как неучтённые, сканер
+    заходил снова. С этой записью такой сценарий невозможен: даже если всё
+    последующее упадёт, сверка увидит ноги как СВОИ, а монитор подхватит
+    позицию из учёта (см. scanner.py:_adopt_positions_from_store).
+
+    _finalize_open потом ПЕРЕЗАПИШЕТ запись полной версией (с комиссиями)
+    — record_open перезаписывает по монете, это штатно. Только для
+    боевых ордеров (status == "OK"): у DRY_RUN своя обработка в executor."""
+    if long_result.get("status") != "OK" or short_result.get("status") != "OK":
+        return
+    try:
+        position_store.record_open(coin.upper(), {
+            "coin": coin.upper(),
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "long_amount_coin": long_result.get("amount_coin"),
+            "short_amount_coin": short_result.get("amount_coin"),
+            "long_entry_price": long_result.get("price"),
+            "short_entry_price": short_result.get("price"),
+            "amount_usdt": long_result.get("amount_usdt") or amount_usdt,
+            "leverage": leverage,
+            "long_order_id": long_result.get("order_id"),
+            "short_order_id": short_result.get("order_id"),
+            "long_taker_fee_rate": long_result.get("taker_fee_rate"),
+            "short_taker_fee_rate": short_result.get("taker_fee_rate"),
+            "provisional": True,  # снимается в _finalize_open полной записью
+        })
+    except Exception as exc:
+        # Сама запись упасть почти не может (локальный JSON), но если
+        # упала — кричим громко: это ровно тот случай, ради которого всё.
+        print(f"[position-store] {coin.upper()}: НЕ УДАЛОСЬ записать предварительную позицию: {type(exc).__name__}: {exc}")
 
 
 def _timings_total_ms(timings: dict) -> float:
@@ -2195,6 +2244,14 @@ class TradeExecutionTool(BaseTool):
         long_ok = long_result["status"] in ok_statuses
         short_ok = short_result["status"] in ok_statuses
 
+        # УЧЁТ — ПЕРВЫМ ДЕЛОМ (см. _persist_provisional_position). Обе ноги
+        # исполнены — с этой секунды они наши, и учёт обязан это знать до
+        # любого выравнивания, проверок, комиссий и отчётов.
+        if long_ok and short_ok:
+            _persist_provisional_position(
+                coin, long_exchange, short_exchange, long_result, short_result, amount_usdt, leverage
+            )
+
         # =====================================================================
         # ВЫРАВНИВАНИЕ СУММ МЕЖДУ НОГАМИ (по явной просьбе пользователя
         # 2026-09-06: "если зашло на 5 долларов на mexc, должно зайти так же
@@ -2243,6 +2300,11 @@ class TradeExecutionTool(BaseTool):
                         f"[align] {coin.upper()}: выравнивание прошло — {small_side} теперь "
                         f"{total_coin:.6g} монет на ${target_usdt:.2f}."
                     )
+                    # Объём ноги изменился — обновляем предварительную запись
+                    # в учёте, чтобы сверка и монитор видели актуальные числа.
+                    _persist_provisional_position(
+                        coin, long_exchange, short_exchange, long_result, short_result, amount_usdt, leverage
+                    )
                 else:
                     # Не удалось выровнять — оставляем позицию как есть (обе
                     # ноги уже реально открыты и захеджированы, просто на
@@ -2288,6 +2350,13 @@ class TradeExecutionTool(BaseTool):
                     )
                     long_result["rollback"] = long_rb
                     short_result["rollback"] = short_rb
+                    # Обе ноги закрыты — предварительная запись в учёте больше
+                    # не соответствует реальности, снимаем (иначе сверка
+                    # решила бы, что ноги «пропали», и подняла тревогу).
+                    try:
+                        position_store.pop_position(coin.upper())
+                    except Exception:
+                        pass
                     return {
                         "coin": coin.upper(),
                         "cancelled": True,

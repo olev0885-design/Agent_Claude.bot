@@ -164,6 +164,43 @@ def _finalize_open(result: dict, spread_percent, notifier, extra_position_fields
     long_ok = long_leg["status"] in ok_statuses
     short_ok = short_leg["status"] in ok_statuses
     both_ok = long_ok and short_ok
+
+    # УЧЁТ — ДО уведомлений и отчёта (перенесено сюда 2026-09-15 после
+    # инцидента BONER: раньше запись стояла в самом конце, ПОСЛЕ сборки
+    # отчёта и отправки в Telegram, и любое исключение по дороге — хоть
+    # форматирование числа — оставляло реально открытые ноги без учёта).
+    # trade_tool уже положил предварительную запись сразу после исполнения
+    # (см. _persist_provisional_position); здесь она ПЕРЕЗАПИСЫВАЕТСЯ полной
+    # версией — с комиссиями и флагами (wide_spread и т.п.).
+    if both_ok:
+        try:
+            position_fields = {
+                "coin": result["coin"],
+                "long_exchange": long_exchange,
+                "short_exchange": short_exchange,
+                "long_amount_coin": long_leg.get("amount_coin"),
+                "short_amount_coin": short_leg.get("amount_coin"),
+                "long_entry_price": long_leg.get("price"),
+                "short_entry_price": short_leg.get("price"),
+                "amount_usdt": long_leg.get("amount_usdt"),
+                "leverage": result.get("leverage"),
+                "long_order_id": long_leg.get("order_id"),
+                "short_order_id": short_leg.get("order_id"),
+                "long_entry_fee_usdt": long_leg.get("fee_usdt"),
+                "short_entry_fee_usdt": short_leg.get("fee_usdt"),
+                "long_taker_fee_rate": long_leg.get("taker_fee_rate"),
+                "short_taker_fee_rate": short_leg.get("taker_fee_rate"),
+            }
+            # См. docstring extra_position_fields — реальный случай
+            # 2026-09-12 (ANTHROPIC): без этого "wide_spread": True терялся
+            # при каждом рестарте бота.
+            if extra_position_fields:
+                position_fields.update(extra_position_fields)
+            position_store.record_open(result["coin"], position_fields)
+        except Exception as exc:
+            # Предварительная запись от trade_tool уже лежит в учёте —
+            # позиция не потеряна, просто без комиссий. Кричим, не падаем.
+            print(f"[position-store] {result['coin']}: полная запись не удалась ({type(exc).__name__}: {exc}) — остаётся предварительная.")
     # Ни одна нога не открылась вообще (реальный случай 2026-09-12:
     # MICRODUCK — обе ноги отклонены биржами: mexc "contract not
     # activated", gate "insufficient margin") — откатывать НЕЧЕГО, деньги
@@ -228,34 +265,8 @@ def _finalize_open(result: dict, spread_percent, notifier, extra_position_fields
         )
 
     if both_ok:
-        # Записываем позицию на учёт — по ней должен прийти "aligned in"
-        # (или закрывающий сигнал сканера), и тогда close_structured_signal()
-        # найдёт её здесь.
-        position_fields = {
-            "coin": result["coin"],
-            "long_exchange": long_exchange,
-            "short_exchange": short_exchange,
-            "long_amount_coin": long_leg.get("amount_coin"),
-            "short_amount_coin": short_leg.get("amount_coin"),
-            "long_entry_price": long_leg.get("price"),
-            "short_entry_price": short_leg.get("price"),
-            "amount_usdt": long_leg.get("amount_usdt"),
-            "leverage": result.get("leverage"),
-            "long_order_id": long_leg.get("order_id"),
-            "short_order_id": short_leg.get("order_id"),
-            "long_entry_fee_usdt": long_leg.get("fee_usdt"),
-            "short_entry_fee_usdt": short_leg.get("fee_usdt"),
-            "long_taker_fee_rate": long_leg.get("taker_fee_rate"),
-            "short_taker_fee_rate": short_leg.get("taker_fee_rate"),
-        }
-        # См. docstring extra_position_fields выше — реальный случай
-        # 2026-09-12 (ANTHROPIC): без этого "wide_spread": True терялся
-        # при каждом рестарте бота, и позиция после рестарта незаметно
-        # переключалась на ОБЫЧНЫЕ правила закрытия вместо тех, что
-        # реально были в силе на момент открытия.
-        if extra_position_fields:
-            position_fields.update(extra_position_fields)
-        position_store.record_open(result["coin"], position_fields)
+        # Запись в position_store уже сделана ВЫШЕ (сразу после both_ok) —
+        # здесь остаётся только журнал и отчёт.
 
         # ЗАПИСЬ "OPEN" В ЖУРНАЛ (добавлено 2026-09-12, по прямой просьбе
         # пользователя — ежедневный отчёт "задержка на ноги + PnL за

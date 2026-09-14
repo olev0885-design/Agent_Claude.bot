@@ -255,6 +255,7 @@ class FundingScanner:
         # отписывалась бы каждые 14 секунд, а WebSocket поднимается 2-10с,
         # и к моменту входа книги в памяти всё равно не было бы.
         self._book_candidates: dict = {}
+        self._last_store_adopt_check: float = 0.0  # см. _position_monitor_loop
 
         # РАЗОВОЕ ИСКЛЮЧЕНИЕ из правила "1 нога на биржу" (см.
         # busy_exchanges выше) — по явной просьбе пользователя 2026-09-08:
@@ -344,8 +345,21 @@ class FundingScanner:
     # бирж), это даёт то же значение с точностью до микроскопических
     # различий округления.
     # -------------------------------------------------------------------
-    def _bootstrap_test_batch_from_position_store(self) -> None:
+    def _bootstrap_test_batch_from_position_store(self, quiet_when_nothing: bool = False) -> int:
+        """Подхватывает в трекер серии ВСЕ позиции из position_store, которых
+        в трекере ещё нет. Возвращает, сколько подхватил.
+
+        Вызывается (1) при старте — восстановление после рестарта, и (2)
+        с 2026-09-15 — на КАЖДОМ тике монитора (см. _adopt_positions_from_
+        store). Второе добавлено после инцидента BONER: если открытие
+        упало ПОСЛЕ записи в учёт (или позицию внесли в учёт руками /
+        reconcile усыновил пару), раньше она не попадала в мониторинг до
+        следующего рестарта — стояла на биржах без контроля закрытия.
+        Идемпотентно: уже известные трекеру монеты пропускаются."""
+        adopted = 0
         for coin, pos in position_store.list_positions().items():
+            if coin.upper() in self.test_batch.open_positions:
+                continue
             # В непрерывном режиме (size<=0) лимита нет — восстанавливаем
             # ВСЕ найденные в учёте позиции, иначе часть осталась бы без
             # мониторинга после рестарта.
@@ -393,12 +407,15 @@ class FundingScanner:
                     # здесь она читается обратно.
                     wide_spread=bool(pos.get("wide_spread")),
                 )
+                adopted += 1
                 print(
-                    f"[test_batch] Восстановлена позиция {coin} из position_store после рестарта: "
-                    f"LONG {long_exchange}/{short_exchange} SHORT, спред входа {entry_spread_pct:.2f}%."
+                    f"[test_batch] Подхвачена позиция {coin} из position_store: "
+                    f"LONG {long_exchange}/{short_exchange} SHORT, спред входа {entry_spread_pct:.2f}%"
+                    f"{' (предварительная запись — комиссии уточнятся)' if pos.get('provisional') else ''}."
                 )
             except Exception as exc:
-                print(f"[test_batch] Не удалось восстановить позицию {coin} из position_store: {exc}")
+                print(f"[test_batch] Не удалось подхватить позицию {coin} из position_store: {exc}")
+        return adopted
 
     # -------------------------------------------------------------------
     # run() — основной бесконечный цикл. Каждая итерация обёрнута в
@@ -645,6 +662,13 @@ class FundingScanner:
                 # проверки на наличие позиций: когда закрывается последняя,
                 # _monitor_test_batch() уже не вызывается, и висящие
                 # подписки надо снять именно здесь.
+                # Подхват позиций, появившихся в учёте мимо трекера (см.
+                # _bootstrap_test_batch_from_position_store). Не чаще раза
+                # в 2с: тик монитора без позиций крутится каждые 20мс, а
+                # читать файл 50 раз в секунду незачем.
+                if time.monotonic() - self._last_store_adopt_check >= 2.0:
+                    self._last_store_adopt_check = time.monotonic()
+                    self._bootstrap_test_batch_from_position_store()
                 await self._sync_book_streams()
                 if self.test_batch.open_positions:
                     await asyncio.wait_for(self._monitor_test_batch(), timeout=self._cycle_timeout_seconds)
@@ -1020,6 +1044,7 @@ class FundingScanner:
 
         orphans_found = 0
         from_stream = 0
+        confirmed_orphans: list = []  # см. «УСЫНОВЛЕНИЕ ХЕДЖ-ПАР» ниже
         checked_exchanges = 0
         checked_exchange_names = set()
         real_pairs = set()  # (exchange, coin) — реально найдены на бирже (для обратной проверки ниже)
@@ -1119,24 +1144,122 @@ class FundingScanner:
                     print(
                         f"[reconcile] {coin} на {exchange_name}: похоже на неучтённую "
                         f"позицию (side={p.get('side')}, contracts={contracts}) — "
-                        f"жду подтверждения на следующем прогоне, прежде чем закрывать."
+                        f"жду подтверждения на следующем прогоне, прежде чем действовать."
                     )
                     continue
 
-                # ВТОРОЕ подряд обнаружение — теперь уверенно закрываем.
+                # ВТОРОЕ подряд обнаружение — подтверждённая неучтённая нога.
+                # НЕ закрываем здесь же (изменено 2026-09-15, инцидент BONER):
+                # сначала собираем ВСЕ подтверждённые ноги этого прогона, а
+                # после обхода бирж решаем по каждой монете — см. блок
+                # «УСЫНОВЛЕНИЕ ХЕДЖ-ПАР» ниже. Иначе две ноги одной монеты на
+                # двух биржах (long + short — то есть готовая, захеджированная
+                # позиция) закрывались по очереди как две независимые сироты,
+                # и каждое такое закрытие пересекало тонкий стакан впустую
+                # (реально: два круга по −0.41 USDT за две минуты).
                 del self._pending_orphans[key]
+                try:
+                    contract_size = client.market(symbol).get("contractSize") or 1
+                except Exception:
+                    contract_size = 1
+                confirmed_orphans.append({
+                    "exchange": exchange_name,
+                    "coin": coin,
+                    "symbol": symbol,
+                    "side": (p.get("side") or "").lower(),
+                    "contracts": abs(contracts),
+                    "amount_coin": abs(contracts) * contract_size,
+                    "entry_price": p.get("entryPrice"),
+                    "notional": p.get("notional") or (abs(contracts) * contract_size * (p.get("entryPrice") or 0)),
+                    "unrealized": p.get("unrealizedPnl"),
+                })
+
+        # =====================================================================
+        # УСЫНОВЛЕНИЕ ХЕДЖ-ПАР vs ЗАКРЫТИЕ ОДИНОЧНЫХ СИРОТ (добавлено 2026-09-15).
+        #
+        # Если по монете подтверждены РОВНО две неучтённые ноги на РАЗНЫХ
+        # биржах, одна long и одна short, с близким номиналом — это не две
+        # ошибки, а одна ГОТОВАЯ позиция, о которой учёт по какой-то причине
+        # не узнал (упавшее открытие, ручной вход, сбой записи). Резать её —
+        # значит платить за пересечение двух стаканов и комиссии ради того,
+        # чтобы через минуту сканер открыл то же самое снова. Вместо этого
+        # берём её под управление: пишем в position_store (монитор подхватит
+        # на ближайшем тике, см. _bootstrap_test_batch_from_position_store) и
+        # ГРОМКО сообщаем — владелец должен знать, что бот ведёт позицию,
+        # которую сам не открывал (или открывал, но потерял). Правила
+        # закрытия для усыновлённой — как для wide_spread: только по прибыли,
+        # без лимита времени; истории её схождения мы не знаем.
+        #
+        # Одиночная нога (пары нет) — как раньше: закрываем, это голый риск.
+        # Нога, у которой пара ещё только на ПЕРВОМ обнаружении (биржи
+        # ответили с разбегом во времени) — ждём следующего прогона, не
+        # режем половину будущей пары.
+        # =====================================================================
+        by_coin: dict = {}
+        for o in confirmed_orphans:
+            by_coin.setdefault(o["coin"], []).append(o)
+        pending_coins = {c for (_, c) in self._pending_orphans}
+        adopt_tolerance = _get_float_env("RECONCILE_ADOPT_NOTIONAL_TOLERANCE", 0.25)
+
+        for coin, legs in by_coin.items():
+            longs = [l for l in legs if l["side"] == "long"]
+            shorts = [l for l in legs if l["side"] == "short"]
+            is_pair = (
+                len(legs) == 2 and len(longs) == 1 and len(shorts) == 1
+                and longs[0]["exchange"] != shorts[0]["exchange"]
+                and longs[0]["notional"] and shorts[0]["notional"]
+                and abs(longs[0]["notional"] - shorts[0]["notional"]) / max(longs[0]["notional"], shorts[0]["notional"]) <= adopt_tolerance
+            )
+            if is_pair:
+                L, S = longs[0], shorts[0]
+                orphans_found += 2
+                entry_spread = (
+                    (S["entry_price"] - L["entry_price"]) / L["entry_price"] * 100
+                    if L["entry_price"] and S["entry_price"] else None
+                )
+                record = {
+                    "coin": coin,
+                    "long_exchange": L["exchange"], "short_exchange": S["exchange"],
+                    "long_amount_coin": L["amount_coin"], "short_amount_coin": S["amount_coin"],
+                    "long_entry_price": L["entry_price"], "short_entry_price": S["entry_price"],
+                    "amount_usdt": round(max(L["notional"], S["notional"]), 2),
+                    "leverage": _get_int_env("TRADE_LEVERAGE", 5),
+                    "long_taker_fee_rate": None, "short_taker_fee_rate": None,
+                    "wide_spread": True,
+                    "adopted": True,
+                    "adopted_note": "усыновлена reconcile: две неучтённые ноги образовали хедж-пару",
+                }
+                try:
+                    position_store.record_open(coin, record)
+                    spread_note = f", спред входа {entry_spread:.2f}%" if entry_spread is not None else ""
+                    msg = (
+                        f"🧩 УСЫНОВЛЕНА ПОЗИЦИЯ {coin}: на биржах нашлись две неучтённые ноги, "
+                        f"образующие хедж — LONG {L['exchange']} {L['amount_coin']:g} @ {L['entry_price']} / "
+                        f"SHORT {S['exchange']} {S['amount_coin']:g} @ {S['entry_price']}{spread_note}. "
+                        f"Взял под управление (закрытие только по прибыли), НЕ закрывал. "
+                        f"Если это не ваша позиция — сообщите."
+                    )
+                    print(f"[reconcile] {msg}")
+                    try:
+                        self.notifier.notify_error(symbol=coin, error_message=msg)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    print(f"[reconcile] {coin}: не удалось усыновить пару ({type(exc).__name__}: {exc}) — оставляю ноги как есть до следующего прогона.")
+                continue
+
+            for o in legs:
+                if coin in pending_coins and len(legs) == 1:
+                    # Вторая нога этой монеты уже замечена, но ещё не
+                    # подтверждена — не режем половину пары, ждём прогон.
+                    print(f"[reconcile] {coin} на {o['exchange']}: вторая нога на первом обнаружении — жду, не закрываю.")
+                    self._pending_orphans[(o["exchange"], coin)] = time.monotonic()
+                    continue
                 orphans_found += 1
-                # ОРФАН — реальная позиция на бирже, о которой position_
-                # store ничего не знает. Алертим НЕМЕДЛЕННО, до попытки
-                # закрытия (если закрытие само упадёт — пользователь всё
-                # равно уже в курсе и может вмешаться вручную).
-                side = p.get("side")
-                entry_price = p.get("entryPrice")
-                unrealized = p.get("unrealizedPnl")
                 alert_msg = (
-                    f"🚨 НЕУЧТЁННАЯ ПОЗИЦИЯ: {coin} на {exchange_name} "
-                    f"(side={side}, contracts={contracts}, entry={entry_price}, "
-                    f"unrealizedPnl={unrealized}) — бот об этой ноге не знал. "
+                    f"🚨 НЕУЧТЁННАЯ ПОЗИЦИЯ: {coin} на {o['exchange']} "
+                    f"(side={o['side']}, contracts={o['contracts']}, entry={o['entry_price']}, "
+                    f"unrealizedPnl={o['unrealized']}) — бот об этой ноге не знал, пары ей нет. "
                     f"Пытаюсь закрыть автоматически."
                 )
                 print(f"[reconcile] {alert_msg}")
@@ -1144,16 +1267,10 @@ class FundingScanner:
                     self.notifier.notify_error(symbol=coin, error_message=alert_msg)
                 except Exception:
                     pass
-
                 try:
-                    market = client.market(symbol)
-                    contract_size = market.get("contractSize") or 1
-                    amount_in_coin = abs(contracts) * contract_size
-                    original_side = "long" if (side or "").lower() == "long" else "short"
-                    result = await tool._close_single_order(
-                        exchange_name, coin, original_side, amount_in_coin
-                    )
-                    done_msg = f"Неучтённая позиция {coin} на {exchange_name} закрыта автоматически: {result}"
+                    original_side = "long" if o["side"] == "long" else "short"
+                    result = await tool._close_single_order(o["exchange"], coin, original_side, o["amount_coin"])
+                    done_msg = f"Неучтённая позиция {coin} на {o['exchange']} закрыта автоматически: {result}"
                     print(f"[reconcile] {done_msg}")
                     try:
                         self.notifier.notify_error(symbol=coin, error_message=done_msg)
@@ -1162,7 +1279,7 @@ class FundingScanner:
                 except Exception as exc:
                     fail_msg = (
                         f"НЕ УДАЛОСЬ автоматически закрыть неучтённую позицию {coin} "
-                        f"на {exchange_name}: {type(exc).__name__}: {exc} — ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА!"
+                        f"на {o['exchange']}: {type(exc).__name__}: {exc} — ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА!"
                     )
                     print(f"[reconcile] {fail_msg}")
                     try:
