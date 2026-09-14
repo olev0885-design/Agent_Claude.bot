@@ -67,3 +67,6 @@ daily_report_state.json
 
 # --- Заметка для Telegram при рестарте (main.py читает и удаляет) — операционная, не в репозиторий ---
 restart_note.txt
+
+# --- Почтовый ящик для Telegram (scanner.py:_telegram_outbox_loop) — операционное ---
+telegram_outbox/

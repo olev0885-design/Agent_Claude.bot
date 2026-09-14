@@ -437,6 +437,11 @@ class FundingScanner:
         # когда часы ПК отставали на 3ч42м и ни один подписанный запрос не
         # проходил, а бот при этом выглядел исправным.
         self._clock_guard_task = asyncio.create_task(self._clock_guard_loop())
+        # См. _telegram_outbox_loop — отправка в Telegram сообщений, положенных
+        # в папку telegram_outbox/ внешними процессами (планировщик Windows,
+        # ручные напоминания), без перезапуска бота и без второго Telethon-
+        # клиента на тот же файл сессии.
+        self._outbox_task = asyncio.create_task(self._telegram_outbox_loop())
         try:
             while True:
                 cycle_start = time.monotonic()
@@ -702,6 +707,71 @@ class FundingScanner:
     # шлёт отчёт повторно за уже отправленные сутки, даже если бот
     # перезапускали несколько раз в течение дня.
     # -------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # _telegram_outbox_loop — «почтовый ящик» для Telegram.
+    #
+    # Добавлено 2026-09-14 по прямой просьбе пользователя ("напомни завтра в
+    # телеграм @Depositik в 15.00"). Проблема, которую это решает: у бота
+    # ОДИН Telethon-клиент на файл сессии bot_session.session (SQLite), и
+    # второй процесс, открывающий ту же сессию ради одного сообщения,
+    # рискует получить "database is locked" или сломать сессию. Раньше
+    # единственным способом что-то отправить снаружи был restart_note.txt —
+    # то есть перезапуск бота ради одной строки текста.
+    #
+    # Теперь: любой процесс кладёт .txt в папку telegram_outbox/ (в корне
+    # проекта). Формат — первая строка «to: @Depositik, me», пустая строка,
+    # дальше текст. Бот раз в несколько секунд забирает файл, отправляет
+    # через СВОЙ notifier и удаляет. Отправленное дублируется в лог.
+    # Ошибка отправки — файл переименовывается в .failed, чтобы не
+    # зациклиться и чтобы было видно, что именно не ушло.
+    #
+    # Никакой торговой логики здесь нет; сбой этого цикла ни на что, кроме
+    # доставки таких сообщений, не влияет.
+    # -------------------------------------------------------------------
+    async def _telegram_outbox_loop(self) -> None:
+        outbox_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "telegram_outbox",
+        )
+        os.makedirs(outbox_dir, exist_ok=True)
+        interval = _get_float_env("TELEGRAM_OUTBOX_POLL_SECONDS", 5.0)
+        while True:
+            try:
+                for name in sorted(os.listdir(outbox_dir)):
+                    if not name.lower().endswith(".txt"):
+                        continue
+                    path = os.path.join(outbox_dir, name)
+                    try:
+                        # utf-8-sig: съедает BOM, который ставят PowerShell
+                        # (Set-Content -Encoding utf8) и Блокнот — иначе
+                        # заголовок «to:» не распознаётся и письмо уходит
+                        # адресату по умолчанию вместе с самим заголовком
+                        # (реальный случай при первой проверке 2026-09-14).
+                        with open(path, "r", encoding="utf-8-sig") as f:
+                            raw = f.read().replace("\r\n", "\n")
+                        header, _, body = raw.partition("\n\n")
+                        recipients = ("me",)
+                        if header.lower().startswith("to:"):
+                            recipients = tuple(
+                                r.strip() for r in header[3:].split(",") if r.strip()
+                            ) or ("me",)
+                        else:
+                            body = raw  # заголовка нет — весь файл и есть текст, адресат по умолчанию
+                        body = body.strip()
+                        if body:
+                            self.notifier._dispatch(body, recipients=recipients)
+                            print(f"[outbox] отправлено {name} -> {', '.join(recipients)}: {body[:80]!r}")
+                        os.remove(path)
+                    except Exception as exc:
+                        print(f"[outbox] не удалось отправить {name}: {type(exc).__name__}: {exc}")
+                        try:
+                            os.replace(path, path + ".failed")
+                        except OSError:
+                            pass
+            except Exception as exc:
+                print(f"[outbox] ошибка цикла: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(1.0, interval))
+
     async def _clock_guard_loop(self) -> None:
         """Периодически сверяет системные часы с биржами (см. clock_guard.py).
 
