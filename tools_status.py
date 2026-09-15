@@ -39,7 +39,8 @@ def bot_processes() -> list:
 
 
 def log_summary(path: str) -> dict:
-    res = {"heartbeat": None, "traceback": 0, "net_errors": 0, "trades": [], "guards": 0}
+    res = {"heartbeat": None, "traceback": 0, "net_errors": 0, "trades": [], "guards": 0,
+           "stream_stats": None, "stream_triggers": 0, "stream_subs": []}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -53,6 +54,12 @@ def log_summary(path: str) -> dict:
                     res["trades"].append(line.strip()[:140])
                 if "[entry-guard]" in line or "[close-guard]" in line:
                     res["guards"] += 1
+                if "[stream-stats]" in line:
+                    res["stream_stats"] = line.strip()[len("[stream-stats] "):][:200]
+                if "[stream-trigger]" in line and "передаю в цепочку" in line:
+                    res["stream_triggers"] += 1
+                if "[price-stream]" in line and "всего подписано" in line:
+                    res["stream_subs"].append(line.strip()[len("[price-stream] "):][:80])
     except Exception as exc:
         res["error"] = f"{type(exc).__name__}: {exc}"
     return res
@@ -93,6 +100,11 @@ def main() -> int:
     print(f"  Traceback: {ls['traceback']}   сетевых ошибок: {ls['net_errors']}   срабатываний guard: {ls['guards']}")
     for t in ls["trades"][-4:]:
         print("  ", t)
+    print("=== ГИБРИД (событийное обнаружение по стакану) ===")
+    print(f"  триггеров потока в этом логе: {ls['stream_triggers']}")
+    print("  " + (ls["stream_stats"] or "статистика ещё не печаталась (раз в 10 мин)"))
+    for line in ls["stream_subs"][-3:]:
+        print("  подписки:", line)
 
     print("=== УЧЁТ (position_store) ===")
     try:
