@@ -96,6 +96,7 @@ async def _pump(key, exchange, symbol: str) -> None:
                 break
             entry["book"] = book
             entry["ts"] = time.monotonic()
+            entry["ever_ok"] = True
             # ИСТОРИЯ СЕРЕДИНЫ СТАКАНА (добавлено 2026-09-15 после MTL): каждое
             # обновление — точка (время, mid). По ней recent_move_pct() за 0мс
             # отвечает, насколько цена дёргалась в последние секунды — без
@@ -114,18 +115,25 @@ async def _pump(key, exchange, symbol: str) -> None:
             raise
         except Exception as exc:
             failures += 1
-            if failures >= _MAX_CONSECUTIVE_FAILURES:
+            entry = _STREAMS.get(key)
+            ever_ok = bool(entry and entry.get("ever_ok"))
+            # То же правило, что в private_stream: сдаёмся только если поток
+            # НИ РАЗУ не работал (биржа не отдаёт стакан по WS — mexc).
+            # Работавший поток при обрыве сети переподключается бесконечно
+            # с растущей паузой — иначе одно моргание Wi-Fi лишало монитор
+            # потокового стакана на 30 минут.
+            if failures >= _MAX_CONSECUTIVE_FAILURES and not ever_ok:
                 print(
                     f"[book-stream] {key[0]}/{symbol}: поток не поднялся {failures} раз "
                     f"({type(exc).__name__}) — остаюсь на REST для этой пары."
                 )
-                entry = _STREAMS.get(key)
                 if entry is not None:
                     entry["gave_up"] = True
                 _EXCHANGE_COOLOFF_UNTIL[key[0]] = time.monotonic() + _EXCHANGE_COOLOFF_SECONDS
                 return
-            print(f"[book-stream] {key[0]}/{symbol}: обрыв потока ({type(exc).__name__}) — переподключаюсь ({failures}/{_MAX_CONSECUTIVE_FAILURES}).")
-            await asyncio.sleep(2.0)
+            delay = min(2.0 * (2 ** max(failures - 1, 0)), 60.0)
+            print(f"[book-stream] {key[0]}/{symbol}: обрыв потока ({type(exc).__name__}) — переподключаюсь через {delay:.0f}с (попытка {failures}).")
+            await asyncio.sleep(delay)
 
 
 async def subscribe(exchange_id: str, symbol: str, config: dict) -> None:

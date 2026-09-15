@@ -2803,20 +2803,43 @@ class TradeExecutionTool(BaseTool):
             # успешным. Исправление: берём МАКСИМУМ по всем совпадениям
             # symbol, а не первое попавшееся.
             live_contracts = None
-            try:
-                live_positions = await exchange.fetch_positions([symbol])
+            # СНАЧАЛА — ПОТОК ПОЗИЦИЙ (добавлено 2026-09-15). Эта сверка стоила
+            # 300–1000мс REST на КАЖДУЮ ногу КАЖДОГО закрытия — закрытия шли
+            # втрое медленнее открытий (медиана 1609мс против 500). Поток
+            # позиций (private_stream) держит тот же срез в памяти.
+            # ГРАНИЦА БЕЗОПАСНОСТИ (см. шапку private_stream.py): потоку
+            # доверяем только ПОЛОЖИТЕЛЬНЫЙ ответ — «позиция есть, вот
+            # объём». Если поток говорит «позиции нет» или потока нет —
+            # идём по REST, как раньше: вывод «закрывать нечего» по потоку
+            # делать нельзя (тишина потока неотличима от отсутствия).
+            streamed = private_stream.get_positions(exchange_name)
+            if streamed is not None:
                 matches = [
                     (p.get("contracts") or 0.0)
-                    for p in live_positions
-                    if p.get("symbol") == symbol
+                    for p in streamed
+                    if p.get("symbol") == symbol and (p.get("contracts") or 0.0) > 0
+                    # На hedge-биржах на одном символе два слота (long/short) —
+                    # берём свой; если биржа сторону не отдаёт — не фильтруем.
+                    and (not p.get("side") or str(p.get("side")).lower() == original_side)
                 ]
                 if matches:
                     live_contracts = max(matches)
-            except Exception as exc:
-                print(
-                    f"[close] {symbol}: не удалось сверить реальный остаток позиции "
-                    f"({exc}) — использую объём из учёта как раньше."
-                )
+                    print(f"[close] {symbol}: остаток позиции взят из ПОТОКА (0мс): {live_contracts} контр.")
+            if live_contracts is None:
+                try:
+                    live_positions = await exchange.fetch_positions([symbol])
+                    matches = [
+                        (p.get("contracts") or 0.0)
+                        for p in live_positions
+                        if p.get("symbol") == symbol
+                    ]
+                    if matches:
+                        live_contracts = max(matches)
+                except Exception as exc:
+                    print(
+                        f"[close] {symbol}: не удалось сверить реальный остаток позиции "
+                        f"({exc}) — использую объём из учёта как раньше."
+                    )
 
             if live_contracts is not None:
                 if live_contracts <= 0:

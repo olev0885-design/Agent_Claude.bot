@@ -80,6 +80,22 @@ _MAX_REMEMBERED_ORDERS = 500
 # переподключений к MEXC, который фьючерсный стакан не отдаёт вовсе).
 _MAX_CONSECUTIVE_FAILURES = 3
 
+# ПРАВИЛО ПЕРЕПОДКЛЮЧЕНИЯ (уточнено 2026-09-15 после разбора binance):
+# лимит _MAX_CONSECUTIVE_FAILURES — для потоков, которые НИ РАЗУ не
+# поднялись (биржа их не поддерживает: mexc/позиции) — там повторять
+# бессмысленно. Поток, который ХОТЬ РАЗ работал, — это рабочий поток,
+# у которого сейчас проблемы с сетью; сдаваться нельзя, надо ждать сеть.
+# Реальный случай: за сутки binance-поток 10 раз рвался на моргании Wi-Fi,
+# 4 раза «сдавался» за 6 секунд и уходил на REST на 10 минут — итог: ни
+# ОДНОГО подтверждения исполнения потоком от binance за сутки, каждая
+# binance-нога шла через REST-лестницу (700–1000мс против 300–500 у bybit).
+# Теперь такой поток переподключается бесконечно с растущей паузой.
+_RECONNECT_BACKOFF_MAX_SECONDS = 60.0
+
+
+def _reconnect_delay(failures: int) -> float:
+    return min(2.0 * (2 ** max(failures - 1, 0)), _RECONNECT_BACKOFF_MAX_SECONDS)
+
 # Через сколько секунд после того, как ВСЕ насосы биржи сдались, разрешаем
 # подписаться заново. Добавлено 2026-09-15: после сна ноутбука сеть
 # возвращается не сразу, три попытки с паузой 2с проходят впустую, и без
@@ -192,6 +208,7 @@ async def _positions_pump(exchange_name: str, exchange) -> None:
                 else:
                     positions.pop(symbol, None)
             state["last_update"] = time.monotonic()
+            state["positions_ever_ok"] = True
             failures = 0
         except asyncio.CancelledError:
             raise
@@ -204,7 +221,8 @@ async def _positions_pump(exchange_name: str, exchange) -> None:
                 # не описывают реальность. Сбрасываем флаг — следующая
                 # итерация возьмёт свежий полный снимок по REST.
                 state["seeded"] = False
-                if failures >= _MAX_CONSECUTIVE_FAILURES:
+                ever_ok = state.get("positions_ever_ok", False)
+                if failures >= _MAX_CONSECUTIVE_FAILURES and not ever_ok:
                     state["positions_gave_up"] = True
                     state["gave_up_at"] = time.monotonic()
                     print(
@@ -212,11 +230,12 @@ async def _positions_pump(exchange_name: str, exchange) -> None:
                         f"{failures} раз ({type(exc).__name__}) — остаюсь на REST."
                     )
                     return
+            delay = _reconnect_delay(failures)
             print(
                 f"[private-stream] {exchange_name}: обрыв потока позиций "
-                f"({type(exc).__name__}) — переподключаюсь ({failures}/{_MAX_CONSECUTIVE_FAILURES})."
+                f"({type(exc).__name__}) — переподключаюсь через {delay:.0f}с (попытка {failures})."
             )
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(delay)
 
 
 async def _orders_pump(exchange_name: str, exchange) -> None:
@@ -242,13 +261,15 @@ async def _orders_pump(exchange_name: str, exchange) -> None:
             while len(orders) > _MAX_REMEMBERED_ORDERS:
                 orders.pop(next(iter(orders)))
             state["orders_last_update"] = time.monotonic()
+            state["orders_ever_ok"] = True
             failures = 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             failures += 1
             state = _STREAMS.get(exchange_name)
-            if failures >= _MAX_CONSECUTIVE_FAILURES:
+            ever_ok = bool(state and state.get("orders_ever_ok"))
+            if failures >= _MAX_CONSECUTIVE_FAILURES and not ever_ok:
                 if state is not None:
                     state["orders_gave_up"] = True
                     state["gave_up_at"] = time.monotonic()
@@ -257,11 +278,12 @@ async def _orders_pump(exchange_name: str, exchange) -> None:
                     f"{failures} раз ({type(exc).__name__}) — остаюсь на REST."
                 )
                 return
+            delay = _reconnect_delay(failures)
             print(
                 f"[private-stream] {exchange_name}: обрыв потока ордеров "
-                f"({type(exc).__name__}) — переподключаюсь ({failures}/{_MAX_CONSECUTIVE_FAILURES})."
+                f"({type(exc).__name__}) — переподключаюсь через {delay:.0f}с (попытка {failures})."
             )
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(delay)
 
 
 # =============================================================================
