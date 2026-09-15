@@ -169,6 +169,9 @@ class FundingScanner:
         self.excluded_coin_exchange_pairs = blocked_coins_store.parse_coin_exchange_pairs(
             os.getenv("SCANNER_EXCLUDED_COIN_EXCHANGE_PAIRS", "")
         )
+        # Контракты, закрытые биржей для API-торговли (см. _api_blocked_coins):
+        # exchange_id -> (monotonic-время обновления, множество монет).
+        self._api_blocked: dict[str, tuple[float, set]] = {}
 
         # Монеты, для которых закрытие срабатывает СРАЗУ при net_pnl >= 0,
         # БЕЗ ожидания схождения спреда до close_spread_max_pct — по явной
@@ -1693,6 +1696,51 @@ class FundingScanner:
             async with self._handle_lock:
                 await self._handle_opportunity(opp)
 
+    async def _api_blocked_coins(self, exchange_id: str, exchange) -> set:
+        """Монеты, контракты которых биржа НЕ открывает для API-торговли —
+        отсекаем ещё в сканере, не дожидаясь отката ноги.
+
+        Найдено 2026-09-15 при проверке DELTA с сервера: у MEXC в публичной
+        карточке контракта (contract/detail) есть флаг apiAllowed, и он
+        False РОВНО у тех контрактов, на которых ордер падает с
+        "Contract not activated" (code 1002) — все 10 наших ручных
+        исключений *:mexc, а также FATCOIN/SUE/PAIR/SPACEHOOD/BUILD из
+        старого общего бана, и INDEX. Всего 41 из 1061 USDT-перпетуалов.
+        Это не регион и не аккаунт (из Токио так же), а свойство контракта
+        — торговать им можно только с сайта/приложения. Раньше бот узнавал
+        об этом ПОСТФАКТУМ: одна нога исполнялась, вторая падала, откат,
+        комиссии, блок монеты (auto_exclude_coin_on_exchange). Теперь —
+        заранее, одним bulk-запросом раз в MEXC_API_ALLOWED_REFRESH_SECONDS.
+        При сбое запроса держим прошлое множество (нет данных ≠ «всё
+        разрешено»: старый список лучше пустого)."""
+        if exchange_id != "mexc":
+            return set()
+        ttl = _get_float_env("MEXC_API_ALLOWED_REFRESH_SECONDS", 3600.0)
+        cached = self._api_blocked.get(exchange_id)
+        if cached is not None and time.monotonic() - cached[0] < ttl:
+            return cached[1]
+        try:
+            detail = await exchange.contractPublicGetDetail()
+            rows = detail.get("data") or []
+            blocked = {
+                str(r.get("baseCoin") or "").upper()
+                for r in rows
+                if r.get("apiAllowed") is False and r.get("baseCoin")
+            }
+            prev = cached[1] if cached else None
+            self._api_blocked[exchange_id] = (time.monotonic(), blocked)
+            if prev != blocked:
+                print(f"[scanner] {exchange_id}: {len(blocked)} контрактов закрыты для API (apiAllowed=False) — "
+                      f"исключаю из связок на этой бирже: {', '.join(sorted(blocked))[:300]}")
+            return blocked
+        except Exception as exc:
+            print(f"[scanner] {exchange_id}: не удалось получить карточки контрактов ({type(exc).__name__}: {exc}) — "
+                  f"оставляю прошлый список закрытых для API ({len(cached[1]) if cached else 0}).")
+            if cached is not None:
+                self._api_blocked[exchange_id] = (time.monotonic() - ttl + 300.0, cached[1])  # повтор через 5 мин
+                return cached[1]
+            return set()
+
     # -------------------------------------------------------------------
     # _fetch_exchange_data — забирает тикеры (bid/ask) и ставки фандинга
     # ОДНИМ (максимум двумя) bulk-запросом на биржу — НЕ по одному запросу
@@ -1764,12 +1812,16 @@ class FundingScanner:
                 except Exception as exc:
                     print(f"[scanner] {exchange_id}: fetch_funding_rates не сработал ({exc}), продолжаю без фандинга.")
 
+            api_blocked = await self._api_blocked_coins(exchange_id, exchange)
+
             result: dict[str, dict] = {}
             for symbol, ticker in tickers.items():
                 market = exchange.markets.get(symbol)
                 if not market:
                     continue
                 coin = market["base"].upper()
+                if coin in api_blocked:
+                    continue  # биржа не даёт торговать этим контрактом по API — см. _api_blocked_coins
                 bid, ask = ticker.get("bid"), ticker.get("ask")
                 # Раньше отсутствие bid/ask считалось "неликвидный контракт
                 # без реального стакана" и монета исключалась целиком — но
