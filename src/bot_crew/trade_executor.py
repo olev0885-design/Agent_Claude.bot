@@ -324,6 +324,7 @@ def _finalize_open(result: dict, spread_percent, notifier, extra_position_fields
             # Разбивка задержки по этапам (стакан/проверки/ордера/комиссии)
             # — см. timings в trade_tool.py:_open_both_legs_async.
             "timings": result.get("timings"),
+            "trigger_source": (extra_position_fields or {}).get("trigger_source"),
             "opened_at": datetime.now(timezone.utc).isoformat(),
         })
         report_lines.append(

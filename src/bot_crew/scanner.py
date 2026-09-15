@@ -30,6 +30,7 @@ from bot_crew import trade_ledger
 from bot_crew import book_stream
 from bot_crew import private_stream
 from bot_crew import clock_guard
+from bot_crew import price_stream
 from bot_crew.config import load_auto_trade_config, load_test_batch_config
 from bot_crew import test_batch as test_batch_mod
 from bot_crew.test_batch import TestBatchTracker
@@ -291,6 +292,26 @@ class FundingScanner:
         # факт −0.02. Монитор тикает непрерывно и ВСЕГДА имеет цену (из
         # потока или по REST) — эта история не зависит от здоровья потока.
         self._leg_price_history: dict = {}
+
+        # СОБЫТИЙНОЕ ОБНАРУЖЕНИЕ ПО СТАКАНУ (см. price_stream.py, 2026-09-15):
+        #   _hot_coins: (exchange_name, symbol) -> monotonic последнего раза,
+        #     когда REST-сканер видел монету вблизи порога входа; живёт
+        #     PRICE_STREAM_HOT_TTL_SECONDS, не больше PRICE_STREAM_HOT_MAX_PER_
+        #     EXCHANGE на биржу — из него собираются подписки на bid/ask.
+        #   _stream_trigger_at: coin -> monotonic последнего триггера — не
+        #     дёргаем цепочку входа по одной монете чаще PRICE_STREAM_TRIGGER_
+        #     COOLDOWN_SECONDS (обновления идут десятки раз в секунду).
+        #   _handle_lock: ОДИН замок на обработку связок — REST-путь и
+        #     событийный НЕ должны обрабатывать вход параллельно (реальный
+        #     случай ALL+BP 2026-09-06: две связки прошли проверку «есть ли
+        #     позиция» одновременно и открылись обе).
+        #   _stream_stats: счётчики для сбора статистики (по просьбе
+        #     пользователя: "начинаем собирать статистику и следить за ошибками").
+        self._hot_coins: dict = {}
+        self._stream_trigger_at: dict = {}
+        self._handle_lock = asyncio.Lock()
+        self._stream_stats: dict = {"updates": 0, "triggers": 0, "handled": 0, "opened": 0, "last_report": time.monotonic()}
+        price_stream.register_on_update(self._on_price_update)
 
         # РАЗОВОЕ ИСКЛЮЧЕНИЕ из правила "1 нога на биржу" (см.
         # busy_exchanges выше) — по явной просьбе пользователя 2026-09-08:
@@ -563,6 +584,11 @@ class FundingScanner:
                     # _sync_book_streams, здесь только отмечаем кандидатов.
                     self._note_book_candidates(opportunities)
                     asyncio.create_task(self._sync_book_streams())
+                    # ГОРЯЧИЙ СПИСОК для потоковых bid/ask (см. price_stream.py):
+                    # монеты вблизи порога — под событийное обнаружение.
+                    self._note_hot_coins(opportunities)
+                    asyncio.create_task(self._sync_price_streams())
+                    self._report_stream_stats()
                 except asyncio.TimeoutError:
                     print(
                         f"[scanner] Цикл сканирования не уложился в "
@@ -1638,7 +1664,10 @@ class FundingScanner:
         полностью завершила попытку открытия. Как только пользователь
         снимет ограничение на 1 позицию — можно будет вернуть gather."""
         for opp in opportunities:
-            await self._handle_opportunity(opp)
+            # Тот же замок, что и у событийного пути (см. _handle_lock в
+            # __init__) — вход обрабатывается строго по одной связке за раз.
+            async with self._handle_lock:
+                await self._handle_opportunity(opp)
 
     # -------------------------------------------------------------------
     # _fetch_exchange_data — забирает тикеры (bid/ask) и ставки фандинга
@@ -2034,15 +2063,18 @@ class FundingScanner:
         if position_store.get_position(opp["coin"]):
             return
 
+        from_stream = opp.get("trigger_source") == "stream"
         print(
-            f"[scanner] Найдена связка: {opp['coin']} LONG {opp['long_exchange']}"
+            f"[scanner] Найдена связка{' (ПОТОК bid/ask)' if from_stream else ''}: {opp['coin']} LONG {opp['long_exchange']}"
             f" / SHORT {opp['short_exchange']}, спред {opp['spread_pct']:.2f}%"
         )
-
-        try:
-            self.notifier.notify_scan_alert(self._format_alert_html(opp))
-        except Exception as exc:
-            print(f"[scanner] Не удалось сформировать/отправить алерт: {exc}")
+        if not from_stream:
+            # Алерт сканера — только для REST-связок: событийные триггеры
+            # приходят десятками в секунду по одной монете, это не для Telegram.
+            try:
+                self.notifier.notify_scan_alert(self._format_alert_html(opp))
+            except Exception as exc:
+                print(f"[scanner] Не удалось сформировать/отправить алерт: {exc}")
 
         # Режим тестовой серии ИСКЛЮЧИТЕЛЬНО управляет открытием, пока
         # включён (см. комментарий в __init__) — общий AUTO_TRADE_ENABLED
@@ -2567,7 +2599,13 @@ class FundingScanner:
             report = await trade_executor.execute_arbitrage_trade_async(
                 opp["coin"], opp["long_exchange"], opp["short_exchange"],
                 amount_usdt, opp["spread_pct"], self.notifier,
-                extra_position_fields={"wide_spread": bool(opp.get("wide_spread"))},
+                extra_position_fields={
+                    "wide_spread": bool(opp.get("wide_spread")),
+                    # Откуда пришёл кандидат — REST-цикл или потоковые bid/ask
+                    # (см. price_stream.py). Для статистики «сколько входов дал
+                    # событийный путь» и сравнения задержек по источникам.
+                    "trigger_source": opp.get("trigger_source") or "rest",
+                },
                 # Готовые стаканы из early-spread-check (см. там же) — чтобы
                 # не запрашивать их второй раз. Возраст проверяется внутри.
                 prefetched_books=opp.get("_book_snapshots"),
@@ -2677,6 +2715,148 @@ class FundingScanner:
                     print(f"[leverage-warm] {exchange_name}/{coin} {side}: плечо {leverage}x выставлено заранее.")
                 if done >= limit:
                     break
+
+    # -------------------------------------------------------------------
+    # СОБЫТИЙНОЕ ОБНАРУЖЕНИЕ ПО СТАКАНУ — см. шапку price_stream.py.
+    # -------------------------------------------------------------------
+    def _note_hot_coins(self, opportunities: list) -> None:
+        """Пополняет горячий список: обе ноги каждой связки со спредом не ниже
+        (порог входа − PRICE_STREAM_HOT_MARGIN_PCT). Запас нужен намеренно —
+        подписка должна стоять ДО того, как спред пробьёт порог."""
+        if not opportunities or self.test_batch is None:
+            return
+        margin = _get_float_env("PRICE_STREAM_HOT_MARGIN_PCT", 1.0)
+        now = time.monotonic()
+        for opp in opportunities:
+            if opp.get("spread_pct", 0) < self._min_spread_for(opp.get("coin")) - margin:
+                continue
+            for ex_key, sym_key in (("long_exchange", "long_symbol"), ("short_exchange", "short_symbol")):
+                ex = (opp.get(ex_key) or "").lower()
+                sym = opp.get(sym_key)
+                if ex in self.test_batch_safe_exchanges and sym:
+                    self._hot_coins[(ex, sym)] = now
+
+    async def _sync_price_streams(self) -> None:
+        """Подписки bid/ask = горячий список (не старше TTL, не больше N на
+        биржу — самые свежие). Публичные данные — ключи не передаются."""
+        if not self.test_batch:
+            return
+        ttl = _get_float_env("PRICE_STREAM_HOT_TTL_SECONDS", 600.0)
+        cap_default = _get_int_env("PRICE_STREAM_HOT_MAX_PER_EXCHANGE", 100)
+        # Индивидуальные лимиты («биржа:N,биржа:N»): binance шлёт bookTicker на
+        # каждое изменение верха стакана — ~20 обновлений/с на ликвидную монету
+        # (замер 2026-09-15: 4 монеты = 80/с), в 4-15 раз чаще остальных.
+        caps = {}
+        for part in (os.getenv("PRICE_STREAM_HOT_MAX_OVERRIDES", "") or "").split(","):
+            if ":" in part:
+                k, _, v = part.partition(":")
+                try:
+                    caps[k.strip().lower()] = int(v)
+                except ValueError:
+                    pass
+        now = time.monotonic()
+        for key, seen_at in list(self._hot_coins.items()):
+            if now - seen_at > ttl:
+                del self._hot_coins[key]
+        per_exchange: dict = {}
+        for (ex, sym), seen_at in self._hot_coins.items():
+            per_exchange.setdefault(ex, []).append((seen_at, sym))
+        for ex in self.test_batch_safe_exchanges:
+            items = sorted(per_exchange.get(ex, []), reverse=True)[:caps.get(ex, cap_default)]
+            wanted = {sym for _, sym in items}
+            ex_id = EXCHANGE_ALIASES.get(ex, ex)
+            config = {"enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": 15000, "_ccxt_id": ex_id}
+            try:
+                await price_stream.sync(ex, wanted, config)
+            except Exception as exc:
+                print(f"[price-stream] {ex}: sync упал: {type(exc).__name__}: {exc}")
+
+    def _on_price_update(self, exchange_name: str, symbol: str) -> None:
+        """Вызывается price_stream на КАЖДОЕ изменение bid/ask. Считает
+        исполнимый спред монеты между всеми биржами, где есть свежие цены,
+        и при пробитии порога отдаёт кандидата в ту же цепочку входа, что и
+        REST-сканер — через _handle_lock, строго по одному."""
+        self._stream_stats["updates"] += 1
+        if self.test_batch is None or not self.test_batch.can_open_more():
+            return
+        coin = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
+        if not coin:
+            return
+        now = time.monotonic()
+        cooldown = _get_float_env("PRICE_STREAM_TRIGGER_COOLDOWN_SECONDS", 3.0)
+        if now - self._stream_trigger_at.get(coin, 0.0) < cooldown:
+            return
+        # свежие цены монеты по всем биржам горячего списка
+        quotes = {}
+        for ex in self.test_batch_safe_exchanges:
+            sym = _build_symbol(ex, coin)
+            q = price_stream.get(ex, sym)
+            if q:
+                bid = _to_usdt_sync(q["bid"], ex)
+                ask = _to_usdt_sync(q["ask"], ex)
+                if bid and ask and ask > 0:
+                    quotes[ex] = (bid, ask, sym)
+        if len(quotes) < 2:
+            return
+        best = None
+        for long_ex, (_, long_ask, long_sym) in quotes.items():
+            for short_ex, (short_bid, _, short_sym) in quotes.items():
+                if long_ex == short_ex:
+                    continue
+                spread = (short_bid - long_ask) / long_ask * 100.0
+                if best is None or spread > best[0]:
+                    best = (spread, long_ex, short_ex, long_sym, short_sym, long_ask, short_bid)
+        if best is None or best[0] < self._min_spread_for(coin):
+            return
+        spread, long_ex, short_ex, long_sym, short_sym, long_ask, short_bid = best
+        self._stream_trigger_at[coin] = now
+        self._stream_stats["triggers"] += 1
+        opp = {
+            "coin": coin,
+            "long_exchange": long_ex,
+            "short_exchange": short_ex,
+            "long_price": long_ask,
+            "short_price": short_bid,
+            "long_symbol": long_sym,
+            "short_symbol": short_sym,
+            "spread_pct": spread,
+            "long_funding_rate": None, "long_funding_ts": None,
+            "short_funding_rate": None, "short_funding_ts": None,
+            "liquidity_usdt": None,
+            "trigger_source": "stream",
+        }
+        print(f"[stream-trigger] {coin}: исполнимый спред по bid/ask {spread:.2f}% (LONG {long_ex} ask {long_ask} / SHORT {short_ex} bid {short_bid}) — передаю в цепочку входа.")
+        asyncio.create_task(self._handle_stream_opportunity(opp))
+
+    async def _handle_stream_opportunity(self, opp: dict) -> None:
+        if _get_bool_env("PRICE_STREAM_SHADOW", False):
+            print(f"[stream-trigger] {opp['coin']}: ТЕНЕВОЙ РЕЖИМ — вход не вызываю, только фиксирую.")
+            return
+        async with self._handle_lock:
+            self._stream_stats["handled"] += 1
+            before = set(self.test_batch.open_positions) if self.test_batch else set()
+            try:
+                await self._handle_opportunity(opp)
+            except Exception as exc:
+                print(f"[stream-trigger] {opp['coin']}: ошибка обработки: {type(exc).__name__}: {exc}")
+            after = set(self.test_batch.open_positions) if self.test_batch else set()
+            if opp["coin"].upper() in (after - before):
+                self._stream_stats["opened"] += 1
+
+    def _report_stream_stats(self) -> None:
+        """Раз в 10 минут — строка статистики событийного обнаружения (по
+        просьбе пользователя: собирать статистику и следить за ошибками)."""
+        now = time.monotonic()
+        if now - self._stream_stats.get("last_report", 0.0) < 600.0:
+            return
+        self._stream_stats["last_report"] = now
+        st = price_stream.stats()
+        subs = ", ".join(f"{ex}:{v['symbols']}/{v['alive']}п" for ex, v in sorted(st.items())) or "нет"
+        print(
+            f"[stream-stats] обновлений bid/ask {self._stream_stats['updates']}, триггеров {self._stream_stats['triggers']}, "
+            f"обработано {self._stream_stats['handled']}, открыто по потоку {self._stream_stats['opened']}; "
+            f"подписки (монет/живых пакетов): {subs}"
+        )
 
     def _note_book_candidates(self, opportunities: list) -> None:
         """Отмечает пары, на которые стоит держать потоковый стакан ЗАРАНЕЕ:
