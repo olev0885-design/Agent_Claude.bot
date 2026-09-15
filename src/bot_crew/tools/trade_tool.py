@@ -1241,6 +1241,31 @@ class TradeExecutionTool(BaseTool):
             print(f"[bitget] Не удалось выставить one_way_mode: {exc}")
 
     @staticmethod
+    async def _ensure_okx_net_mode(exchange, exchange_name: str) -> None:
+        """OKX (добавлен 2026-09-15): аккаунт может быть в long_short_mode
+        (двусторонние позиции) — тогда каждый ордер обязан нести posSide, а
+        наш код (buy=long, sell=short, reduceOnly=закрыть) написан под
+        one-way, у OKX это net_mode. Смотрим конфиг аккаунта один раз за
+        запуск и при необходимости переключаем (возможно только без
+        открытых позиций/ордеров — иначе OKX откажет, и мы это увидим в
+        логе, а ордер упадёт понятной ошибкой 51000/51010)."""
+        cache_key = exchange_name.lower()
+        if cache_key in _position_mode_synced:
+            return
+        try:
+            cfg = await exchange.privateGetAccountConfig()
+            data = (cfg.get("data") or [{}])[0]
+            pos_mode = data.get("posMode")
+            if pos_mode == "net_mode":
+                _position_mode_synced.add(cache_key)
+                return
+            await exchange.set_position_mode(False)  # hedged=False -> net_mode
+            _position_mode_synced.add(cache_key)
+            print(f"[okx] режим позиций переключён {pos_mode} -> net_mode (one-way).")
+        except Exception as exc:
+            print(f"[okx] Не удалось проверить/выставить net_mode: {exc}")
+
+    @staticmethod
     async def _set_leverage_with_fallback(exchange, leverage: int, symbol: str, leverage_params: dict) -> int:
         """Выставляет плечо с автоматическим откатом на МЕНЬШЕЕ, если
         запрошенное биржа не разрешает для этого символа прямо сейчас —
@@ -1412,6 +1437,11 @@ class TradeExecutionTool(BaseTool):
             # Тот же UTA — форсируем classic-эндпоинт и для set_leverage,
             # для консистентности со всеми остальными bitget-вызовами.
             leverage_params = {"uta": False}
+        elif exchange_id == "okx":
+            # OKX: set_leverage обязан получить mgnMode (иначе ArgumentsRequired
+            # marginMode) — cross, как везде; заодно one-way режим аккаунта.
+            await self._ensure_okx_net_mode(exchange, exchange_name)
+            leverage_params = {"marginMode": "cross"}
         elif exchange_id == "gate":
             # У Gate margin mode задаётся ПРЯМО в вызове set_leverage (нет
             # отдельного setMarginMode — см. исходник ccxt gate.py:
@@ -1554,6 +1584,11 @@ class TradeExecutionTool(BaseTool):
                 # set_position_mode/set_leverage) может уйти не на тот
                 # аккаунт и снова словить "Insufficient margin".
                 order_params["uta"] = False
+            elif exchange_id == "okx":
+                # OKX: режим маржи — в самом ордере (tdMode). CCXT по умолчанию
+                # ставит cross, но дублируем явно, как для mexc/kucoin — чтобы
+                # плечо (set_leverage cross) и ордер не разошлись.
+                order_params["marginMode"] = "cross"
             elif exchange_id == "kucoinfutures":
                 # KuCoin (проверено с сервера 2026-09-15): новый API ордеров
                 # без явного marginMode считает ордер ISOLATED, а символ на
@@ -3025,6 +3060,8 @@ class TradeExecutionTool(BaseTool):
                 # См. _ensure_bitget_one_way_mode/_place_single_order — тот
                 # же форс classic-эндпоинта вместо UTA при закрытии.
                 close_params["uta"] = False
+            elif exchange_id == "okx":
+                close_params["marginMode"] = "cross"  # см. _place_single_order
             elif exchange_id == "kucoinfutures":
                 # См. _place_single_order — без явного cross ордер закрытия
                 # уйдёт как isolated и упадёт с 330005, позиция останется.
