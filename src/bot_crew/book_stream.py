@@ -33,6 +33,7 @@
 import asyncio
 import os
 import time
+from collections import deque
 from typing import Optional
 
 import ccxt.pro as ccxt_pro
@@ -95,6 +96,19 @@ async def _pump(key, exchange, symbol: str) -> None:
                 break
             entry["book"] = book
             entry["ts"] = time.monotonic()
+            # ИСТОРИЯ СЕРЕДИНЫ СТАКАНА (добавлено 2026-09-15 после MTL): каждое
+            # обновление — точка (время, mid). По ней recent_move_pct() за 0мс
+            # отвечает, насколько цена дёргалась в последние секунды — без
+            # единого сетевого запроса и без ожидания. Глубина 600 точек с
+            # запасом покрывает 10-15с даже при десятках обновлений в секунду.
+            try:
+                bids, asks = book.get("bids"), book.get("asks")
+                if bids and asks and bids[0] and asks[0]:
+                    entry.setdefault("mids", deque(maxlen=600)).append(
+                        (entry["ts"], (bids[0][0] + asks[0][0]) / 2.0)
+                    )
+            except Exception:
+                pass
             failures = 0
         except asyncio.CancelledError:
             raise
@@ -170,6 +184,37 @@ def get_book(exchange_id: str, symbol: str) -> Optional[dict]:
     if time.monotonic() - entry.get("ts", 0.0) > _max_age_seconds():
         return None
     return book
+
+
+def recent_move_pct(exchange_id: str, symbol: str, window_seconds: float = 10.0) -> Optional[float]:
+    """Размах середины стакана за последние window_seconds, в процентах от
+    последней цены: (max − min) / last × 100. None — если истории нет или
+    точек меньше двух (поток только поднялся) — вызывающий код трактует
+    None как «нет данных», а не как «спокойно».
+
+    Зачем (реальный случай MTL 2026-09-15): оценка PnL перед закрытием была
+    верна для стакана, которому были доли секунды, но за секунду между
+    решением и исполнением bitget провалился на 2% (обвал на выплате
+    funding в 00:00 UTC), и нога закрылась на дне фитиля: ожидали +0.25,
+    получили −0.28. Фильтровать это задержкой (ждать подтверждения)
+    пользователь запретил — «1.5 секунды это очень много». Взгляд НАЗАД
+    на уже полученные обновления стоит 0мс и ловит ту же бурю: если цена
+    прошла процент за десять секунд, сейчас не время ни входить, ни
+    выходить по прибыли."""
+    entry = _STREAMS.get((exchange_id, symbol))
+    if not entry:
+        return None
+    mids = entry.get("mids")
+    if not mids or len(mids) < 2:
+        return None
+    cutoff = time.monotonic() - window_seconds
+    window = [m for ts, m in mids if ts >= cutoff]
+    if len(window) < 2:
+        return None
+    last = window[-1]
+    if not last:
+        return None
+    return (max(window) - min(window)) / last * 100.0
 
 
 def active_streams() -> list:

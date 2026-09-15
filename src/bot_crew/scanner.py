@@ -33,6 +33,7 @@ from bot_crew.config import load_auto_trade_config, load_test_batch_config
 from bot_crew import test_batch as test_batch_mod
 from bot_crew.test_batch import TestBatchTracker
 from bot_crew.tools.trade_tool import (
+    _min_spread_for_coin,
     EXCHANGE_ALIASES,
     EXCHANGE_QUOTE_CURRENCY,
     TradeExecutionTool,
@@ -256,6 +257,7 @@ class FundingScanner:
         # и к моменту входа книги в памяти всё равно не было бы.
         self._book_candidates: dict = {}
         self._last_store_adopt_check: float = 0.0  # см. _position_monitor_loop
+        self._rate_limited_log_at: dict = {}  # см. _log_rate_limited
 
         # РАЗОВОЕ ИСКЛЮЧЕНИЕ из правила "1 нога на биржу" (см.
         # busy_exchanges выше) — по явной просьбе пользователя 2026-09-08:
@@ -918,6 +920,54 @@ class FundingScanner:
                 print(f"[daily-report] Ошибка формирования/отправки отчёта: {exc}")
             last_sent = today_str
             _save_last_sent(last_sent)
+
+    def _storm_pct(self, long_exchange: str, short_exchange: str, long_symbol: str, short_symbol: str) -> float:
+        """Максимальный размах цены за последние SCANNER_STORM_WINDOW_SECONDS
+        по двум ногам (см. book_stream.recent_move_pct). 0.0, если потоков
+        нет — тогда защита не мешает, поведение как до её появления."""
+        window = _get_float_env("SCANNER_STORM_WINDOW_SECONDS", 10.0)
+        worst = 0.0
+        for ex, sym in ((long_exchange, long_symbol), (short_exchange, short_symbol)):
+            ex_id = EXCHANGE_ALIASES.get(ex.lower(), ex.lower())
+            move = book_stream.recent_move_pct(ex_id, sym, window)
+            if move is not None and move > worst:
+                worst = move
+        return worst
+
+    @staticmethod
+    def _in_funding_blackout() -> bool:
+        """±SCANNER_FUNDING_BLACKOUT_MINUTES вокруг 00:00 / 08:00 / 16:00 UTC —
+        выплаты funding на большинстве бирж. Реальный случай MTL 2026-09-15:
+        закрытие в 00:02:03 UTC попало в обвал с объёмом в 30-300 раз выше
+        обычного на обеих биржах. В это окно не открываемся и не закрываемся
+        ПО ПРИБЫЛИ; вынужденные закрытия (сверка, ручные) не ограничены."""
+        minutes = _get_float_env("SCANNER_FUNDING_BLACKOUT_MINUTES", 3.0)
+        if minutes <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        minute_of_day = now.hour * 60 + now.minute + now.second / 60.0
+        for anchor_min in (0, 480, 960, 1440):
+            if abs(minute_of_day - anchor_min) <= minutes:
+                return True
+        return False
+
+    def _log_rate_limited(self, key: str, text: str, every_seconds: float = 15.0) -> None:
+        """Печатает строку не чаще every_seconds по одному ключу — для гейтов,
+        которые срабатывают на каждом тике монитора (доли секунды): иначе
+        одна буря давала бы сотни одинаковых строк."""
+        now = time.monotonic()
+        if now - self._rate_limited_log_at.get(key, 0.0) >= every_seconds:
+            self._rate_limited_log_at[key] = now
+            print(text)
+
+    def _min_spread_for(self, coin: str) -> float:
+        """Порог входа для монеты: индивидуальный из SCANNER_COIN_MIN_SPREAD_
+        OVERRIDES (см. trade_tool._coin_min_spread_overrides — реальный
+        случай BONER 2026-09-15: 5% вместо общих 2.2%) либо общий порог
+        серии. Один источник истины для всех гейтов входа: тикер, ранняя
+        проверка по стакану, кандидаты на потоковый стакан, прогрев плеча
+        и — на стороне trade_tool — проверка перед ордером и после."""
+        return _min_spread_for_coin(coin, self.test_batch.min_spread_pct)
 
     def _in_open_grace_period(self, coin: str) -> bool:
         """True, если попытка открыть эту монету стартовала недавно (см.
@@ -2036,6 +2086,11 @@ class FundingScanner:
         if not self._clock_ok:
             return
 
+        # Окно выплаты funding — не входим (см. _in_funding_blackout).
+        if self._in_funding_blackout():
+            self._log_rate_limited("funding-blackout:entry", "[entry-guard] окно выплаты funding — новые входы отложены.")
+            return
+
         # АВТОМАТИЧЕСКАЯ БЛОКИРОВКА (см. blocked_coins_store.py) — по явной
         # просьбе пользователя 2026-09-09: после нескольких РЕАЛЬНЫХ откатов
         # подряд (не пустых VWAP-отмен) монета перестаёт пытаться открыться
@@ -2112,7 +2167,7 @@ class FundingScanner:
 
         # Порог входа тестовой серии — TEST_BATCH_MIN_SPREAD (по ТЗ: 5.0%),
         # отдельный от порога алерта.
-        if opp["spread_pct"] < self.test_batch.min_spread_pct:
+        if opp["spread_pct"] < self._min_spread_for(opp["coin"]):
             return
 
         # Тестовая серия торгует ТОЛЬКО на биржах из TEST_BATCH_SAFE_EXCHANGES
@@ -2180,10 +2235,10 @@ class FundingScanner:
             short_norm = _to_usdt_sync(short_vwap, opp["short_exchange"]) if short_vwap else None
             if long_norm is not None and short_norm is not None and long_norm > 0:
                 real_spread_pct = (short_norm - long_norm) / long_norm * 100
-                if real_spread_pct < self.test_batch.min_spread_pct:
+                if real_spread_pct < self._min_spread_for(opp["coin"]):
                     print(
                         f"[early-spread-check] {opp['coin'].upper()}: реальный спред по стакану "
-                        f"{real_spread_pct:.2f}% (порог {self.test_batch.min_spread_pct}%, тикер "
+                        f"{real_spread_pct:.2f}% (порог {self._min_spread_for(opp['coin'])}%, тикер "
                         f"показывал {opp['spread_pct']:.2f}%) — пропускаю до дорогой проверки "
                         f"схождения."
                     )
@@ -2478,9 +2533,9 @@ class FundingScanner:
         for opp in opportunities:
             if done >= limit:
                 break
-            if opp.get("spread_pct", 0) < self.test_batch.min_spread_pct:
-                continue
             coin = opp.get("coin")
+            if opp.get("spread_pct", 0) < self._min_spread_for(coin):
+                continue
             for exchange_name, side in ((opp.get("long_exchange"), "long"), (opp.get("short_exchange"), "short")):
                 if not exchange_name or exchange_name.lower() not in self.test_batch_safe_exchanges:
                     continue
@@ -2505,14 +2560,19 @@ class FundingScanner:
             return
         margin = _get_float_env("BOOK_STREAM_CANDIDATE_MARGIN_PCT", 0.5)
         limit = _get_int_env("BOOK_STREAM_CANDIDATE_MAX", 6)
-        threshold = self.test_batch.min_spread_pct - margin
         now = time.monotonic()
         taken = 0
         for opp in sorted(opportunities, key=lambda o: o.get("spread_pct", 0), reverse=True):
             if taken >= limit:
                 break
-            if opp.get("spread_pct", 0) < threshold:
-                break  # список отсортирован — дальше только меньше
+            # Порог — индивидуальный для монеты (см. _min_spread_for), поэтому
+            # не обрываем цикл на первом «ниже общего порога»: у монеты с
+            # повышенным порогом кандидатство наступает позже, у остальных —
+            # раньше. Список отсортирован по убыванию, но сравнение — своё.
+            if opp.get("spread_pct", 0) < self.test_batch.min_spread_pct - margin:
+                break  # ниже общего порога с запасом — дальше только меньше
+            if opp.get("spread_pct", 0) < self._min_spread_for(opp.get("coin")) - margin:
+                continue
             long_ex, short_ex = (opp.get("long_exchange") or "").lower(), (opp.get("short_exchange") or "").lower()
             if long_ex not in self.test_batch_safe_exchanges or short_ex not in self.test_batch_safe_exchanges:
                 continue
@@ -2723,6 +2783,37 @@ class FundingScanner:
                 return False, None
             position, current_spread, profitable, pnl_estimate = r
 
+            # ЗАЩИТА ОТ ФАНТОМНОГО ПЛЮСА (добавлено 2026-09-15 после MTL, без
+            # добавления задержки — по прямому требованию пользователя).
+            # 1) Окно funding — не закрываемся по прибыли вовсе.
+            # 2) Буря: размах цены за последние секунды выше стоп-крана —
+            #    пропускаем ЭТОТ тик (следующий через доли секунды).
+            # 3) Динамический буфер: требуемая прибыль растёт на размах ×
+            #    номинал × K — в спокойном рынке это ноль, порог прежний.
+            if self._in_funding_blackout():
+                self._log_rate_limited(
+                    f"funding-blackout:{position.coin}",
+                    f"[close-guard] {position.coin}: окно выплаты funding — закрытие по прибыли отложено.",
+                )
+                return False, None
+            storm = self._storm_pct(
+                position.long_exchange, position.short_exchange, position.long_symbol, position.short_symbol
+            )
+            storm_cap = _get_float_env("SCANNER_CLOSE_MAX_STORM_PCT", 1.0)
+            if storm > storm_cap:
+                self._log_rate_limited(
+                    f"storm:{position.coin}",
+                    f"[close-guard] {position.coin}: цена прошла {storm:.2f}% за последние секунды "
+                    f"(порог {storm_cap}%) — буря, этот тик пропускаю.",
+                )
+                return False, None
+            k = _get_float_env("SCANNER_CLOSE_VOLATILITY_BUFFER_K", 1.0)
+            extra = storm / 100.0 * (position.amount_usdt or 0.0) * k
+            if pnl_estimate is not None and extra > 0:
+                close_profit_buffer = _get_float_env("SCANNER_CLOSE_PROFIT_BUFFER_USDT", 0.02)
+                profitable = pnl_estimate > close_profit_buffer + extra
+            required = min_profit_usdt + extra
+
             if position.wide_spread:
                 # ОБНОВЛЕНО 2026-09-13 по прямой просьбе пользователя ("закрывай
                 # когда будет +0.10 с учётом комиссии и минусовой ноги"): для
@@ -2735,10 +2826,12 @@ class FundingScanner:
                 # "спред сошёлся до close_spread_max_pct" здесь не используется
                 # (у широкой монеты он по истории не сходится — иначе она не
                 # была бы широкой); в минус не закрываемся, лимита времени нет.
-                if pnl_estimate is not None and pnl_estimate > min_profit_usdt:
+                if pnl_estimate is not None and pnl_estimate > required:
                     return True, (
                         f"широкий спред: чистая прибыль {pnl_estimate:+.4f} USDT "
-                        f"(обе ноги, после комиссий) превысила ${min_profit_usdt:.2f} — закрываю"
+                        f"(обе ноги, после комиссий) превысила ${required:.2f}"
+                        + (f" (в т.ч. надбавка за волатильность {extra:.2f})" if extra > 0 else "")
+                        + " — закрываю"
                     )
                 return False, None
 
@@ -2748,7 +2841,7 @@ class FundingScanner:
                 # См. self.breakeven_close_coins — не ждём схождения спреда,
                 # достаточно net_pnl >= 0.
                 return True, None
-            if pnl_estimate is not None and pnl_estimate >= min_profit_usdt:
+            if pnl_estimate is not None and pnl_estimate >= required:
                 # См. min_profit_usdt выше — заметная прибыль сама по себе
                 # достаточна, спред можно не ждать.
                 return True, None
@@ -2976,7 +3069,12 @@ class FundingScanner:
                 # чтобы гейт не спорил сам с собой: раз PnL успел упасть
                 # ниже — просто ждём следующего цикла, а не фиксируем
                 # ухудшившийся результат.
-                min_net_pnl=_get_float_env("SCANNER_CLOSE_PROFIT_BUFFER_USDT", 0.02),
+                # + та же надбавка за волатильность, что и в решении (см.
+                # _should_close): если за миллисекунды между решением и этой
+                # проверкой рынок задёргался — гейт это увидит здесь.
+                min_net_pnl=_get_float_env("SCANNER_CLOSE_PROFIT_BUFFER_USDT", 0.02)
+                + self._storm_pct(position.long_exchange, position.short_exchange, position.long_symbol, position.short_symbol)
+                / 100.0 * (position.amount_usdt or 0.0) * _get_float_env("SCANNER_CLOSE_VOLATILITY_BUFFER_K", 1.0),
             )
         except Exception as exc:
             print(f"[test_batch] КРИТИЧЕСКАЯ ОШИБКА закрытия {position.coin}: {exc}")

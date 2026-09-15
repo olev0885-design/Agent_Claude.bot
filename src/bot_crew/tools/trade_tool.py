@@ -235,6 +235,36 @@ def _persist_provisional_position(
         print(f"[position-store] {coin.upper()}: НЕ УДАЛОСЬ записать предварительную позицию: {type(exc).__name__}: {exc}")
 
 
+def _coin_min_spread_overrides() -> dict:
+    """SCANNER_COIN_MIN_SPREAD_OVERRIDES — индивидуальный порог входа для
+    отдельных монет, формат «МОНЕТА:процент,МОНЕТА:процент». Добавлено
+    2026-09-15 по прямой просьбе пользователя после BONER ("добавим бонер в
+    исключение, но можно зайти, если спред будет более 5%"): монета не
+    запрещена совсем, но общий порог для неё заменяется своим, более
+    высоким — чтобы на неликвидном рынке компенсация за пересечение тонкого
+    стакана (~1–1.5% на BONER/aster) заранее сидела в спреде входа.
+    Читается из окружения при каждом вызове — правка .env + рестарт, без
+    отдельного кэша (вызовов единицы на сделку)."""
+    raw = os.getenv("SCANNER_COIN_MIN_SPREAD_OVERRIDES", "") or ""
+    out = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        coin, _, value = part.partition(":")
+        try:
+            out[coin.strip().upper()] = float(value)
+        except ValueError:
+            continue
+    return out
+
+
+def _min_spread_for_coin(coin: str, default: float) -> float:
+    """Порог входа для конкретной монеты: индивидуальный (см.
+    _coin_min_spread_overrides) либо общий default."""
+    return _coin_min_spread_overrides().get((coin or "").upper(), default)
+
+
 def _timings_total_ms(timings: dict) -> float:
     """Сумма ТОЛЬКО числовых полей *_ms. Раньше здесь было sum(timings.values())
     — и 2026-09-15 это стоило реальных денег: в словарь замеров добавили
@@ -2064,7 +2094,7 @@ class TradeExecutionTool(BaseTool):
                 _to_usdt(check_long_price, long_exchange),
                 _to_usdt(check_short_price, short_exchange),
             )
-            min_spread = float(os.getenv("TEST_BATCH_MIN_SPREAD", os.getenv("AUTO_TRADE_MIN_SPREAD", "3.0")))
+            min_spread = _min_spread_for_coin(coin, float(os.getenv("TEST_BATCH_MIN_SPREAD", os.getenv("AUTO_TRADE_MIN_SPREAD", "3.0"))))
             if check_long_price is not None and check_short_price is not None and check_long_price > 0:
                 fresh_spread_pct = (check_short_price - check_long_price) / check_long_price * 100
                 if fresh_spread_pct < min_spread:
@@ -2336,7 +2366,7 @@ class TradeExecutionTool(BaseTool):
             short_fill_price = short_result.get("price")
             if long_fill_price and short_fill_price and long_fill_price > 0:
                 realized_spread_pct = (short_fill_price - long_fill_price) / long_fill_price * 100
-                min_spread = float(os.getenv("TEST_BATCH_MIN_SPREAD", os.getenv("AUTO_TRADE_MIN_SPREAD", "3.0")))
+                min_spread = _min_spread_for_coin(coin, float(os.getenv("TEST_BATCH_MIN_SPREAD", os.getenv("AUTO_TRADE_MIN_SPREAD", "3.0"))))
                 if realized_spread_pct < min_spread:
                     print(
                         f"[realized-spread-check] {coin.upper()}: обе ноги открылись, но "
