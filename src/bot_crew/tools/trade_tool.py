@@ -1043,7 +1043,25 @@ class TradeExecutionTool(BaseTool):
             if passphrase:
                 config["password"] = passphrase
 
+        # РЕГИОНАЛЬНАЯ ПЛОЩАДКА (2026-09-15, OKX): у некоторых бирж ключ живёт
+        # не на глобальном домене, а на региональном юрлице с ОТДЕЛЬНЫМ API-
+        # хостом (OKX EEA: eea.okx.com / my.okx.com — на www.okx.com такой
+        # ключ отвечает 50119 "API key doesn't exist"). CCXT строит URL по
+        # шаблону {hostname}, поэтому достаточно передать его в конфиг:
+        # <БИРЖА>_HOSTNAME=eea.okx.com. Пусто — глобальный домен, как раньше.
+        hostname = os.getenv(f"{exchange_name.upper()}_HOSTNAME", "").strip()
+        if hostname:
+            config["hostname"] = hostname
+
         exchange = exchange_class(config)
+
+        if exchange_id == "okx" and hostname == "eea.okx.com":
+            # WebSocket у ccxt.pro для OKX захардкожен на ws.okx.com, а у EEA
+            # свой узел — иначе приватный поток отвечает 60032 "API key
+            # doesn't exist" (проверено с сервера 2026-09-15).
+            ws = exchange.urls.get("api", {}).get("ws")
+            if isinstance(ws, str):
+                exchange.urls["api"]["ws"] = ws.replace("ws.okx.com", "wseea.okx.com")
 
         if exchange_id == "aster":
             # ОБХОД (реализован 2026-09-06 по просьбе пользователя, когда
