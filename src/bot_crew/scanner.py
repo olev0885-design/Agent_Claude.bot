@@ -260,6 +260,7 @@ class FundingScanner:
         # и к моменту входа книги в памяти всё равно не было бы.
         self._book_candidates: dict = {}
         self._last_store_adopt_check: float = 0.0  # см. _position_monitor_loop
+        self._rest_book_cache: dict = {}  # (ex_id, symbol) -> (monotonic, book) — троттлинг REST-стакана в мониторе
         self._rate_limited_log_at: dict = {}  # см. _log_rate_limited
 
         # ПАМЯТЬ РАННИХ ОТКАЗОВ и СЧЁТЧИК СЕТЕВЫХ СБОЕВ НА ПУТИ ВХОДА
@@ -2995,11 +2996,32 @@ class FundingScanner:
             short_ex_id = EXCHANGE_ALIASES.get(position.short_exchange.lower(), position.short_exchange.lower())
             long_book = book_stream.get_book(long_ex_id, position.long_symbol)
             short_book = book_stream.get_book(short_ex_id, position.short_symbol)
+
+            # ТРОТТЛИНГ REST-СТАКАНА (2026-09-15, первый день на сервере): для
+            # биржи без потокового стакана (mexc) монитор ходил за глубиной по
+            # REST на КАЖДОМ тике — каждые 20мс. На ноутбуке 400мс сетевой
+            # задержки были естественным тормозом; из Токио запрос идёт ~150мс,
+            # и mexc ответил 66 раз RateLimitExceeded (510) за три часа. Теперь
+            # REST-книга по символу переиспользуется SCANNER_REST_BOOK_MIN_
+            # INTERVAL_SECONDS — решение о закрытии по ней не устаревает
+            # заметно (0.4с), а нагрузка падает в ~20 раз.
+            min_interval = _get_float_env("SCANNER_REST_BOOK_MIN_INTERVAL_SECONDS", 0.4)
+            now_mono = time.monotonic()
+
+            async def _rest_book(client, ex_id, symbol):
+                key = (ex_id, symbol)
+                cached = self._rest_book_cache.get(key)
+                if cached and now_mono - cached[0] < min_interval:
+                    return cached[1]
+                book = await client.fetch_order_book(symbol, limit=50)
+                self._rest_book_cache[key] = (time.monotonic(), book)
+                return book
+
             try:
                 if long_book is None or short_book is None:
                     fetched = await asyncio.gather(
-                        long_client.fetch_order_book(position.long_symbol, limit=50) if long_book is None else _already(long_book),
-                        short_client.fetch_order_book(position.short_symbol, limit=50) if short_book is None else _already(short_book),
+                        _rest_book(long_client, long_ex_id, position.long_symbol) if long_book is None else _already(long_book),
+                        _rest_book(short_client, short_ex_id, position.short_symbol) if short_book is None else _already(short_book),
                     )
                     long_book, short_book = fetched
             except Exception as exc:
