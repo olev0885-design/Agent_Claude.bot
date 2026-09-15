@@ -2141,6 +2141,16 @@ class FundingScanner:
         # Печатаем ТОЛЬКО РАЗ за цикл (через cooldown-подобный принцип не
         # нужен — is_blocked дешёвая проверка файла, без сети).
         if blocked_coins_store.is_blocked(opp["coin"]):
+            # Раньше — молчаливый return: в логе сотни «Найдена связка CVC
+            # 2.3%» и ни слова, почему не входим (реальный случай CVC/LSK
+            # 2026-09-15). Теперь причина видна, раз в 10 минут по монете.
+            info = blocked_coins_store.get_block_info(opp["coin"]) or {}
+            self._log_rate_limited(
+                f"blocked:{opp['coin']}",
+                f"[entry-guard] {opp['coin'].upper()}: пропущена — заблокирована после откатов "
+                f"({(info.get('reasons') or ['?'])[-1][:90]}).",
+                every_seconds=600.0,
+            )
             return
 
         # См. self._entry_cooldown_until — не пытаемся ПОВТОРНО открыть
@@ -2200,6 +2210,16 @@ class FundingScanner:
             # эта конкретная связка не пройдёт дальнейшие проверки (VWAP и
             # т.п.), исключение остаётся доступным для следующей попытки.
             if not self._busy_exchange_override_available:
+                # Видимость правила «1 нога на биржу» (см. CVC/LSK выше):
+                # раз в 10 минут по монете, чтобы было понятно, ПОЧЕМУ
+                # связка со спредом выше порога не открывается.
+                busy_ex = long_id_check if long_id_check in busy else short_id_check
+                self._log_rate_limited(
+                    f"busy:{opp['coin']}",
+                    f"[entry-guard] {opp['coin'].upper()}: пропущена — на {busy_ex} уже открыта нога "
+                    f"другой позиции (правило «1 нога на биржу»).",
+                    every_seconds=600.0,
+                )
                 return
             bypass_busy_check = True
             print(

@@ -199,11 +199,47 @@ def _save(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# ОШИБКИ БАЛАНСА/МАРЖИ — НЕ ВИНА МОНЕТЫ (добавлено 2026-09-15). Реальный
+# случай: CVC и LSK — самые частые связки ночи (1038 и 540 раз выше порога
+# входа) — молча пропускались, потому что 13.09 были заблокированы после
+# двух откатов «INSUFFICIENT_AVAILABLE» / «Margin is insufficient». Это
+# состояние СЧЁТА в тот момент (денег на бирже не хватало), а не свойство
+# монеты; счёт давно пополнен, перед ордером теперь стоит balance-guard, а
+# блок висел бы вечно. Такие причины в счётчик откатов не идут.
+_BALANCE_ERROR_MARKERS = (
+    "insufficient_available", "insufficient available", "margin is insufficient",
+    "insufficient margin", "insufficient balance", "not enough", "code\":-2019", "code\":\"40762",
+)
+
+
+def _is_balance_error(reason: str) -> bool:
+    low = (reason or "").lower()
+    return any(m.lower() in low for m in _BALANCE_ERROR_MARKERS)
+
+
+def _block_ttl_hours() -> float:
+    """Срок жизни блокировки по откатам. Раньше блок был ВЕЧНЫМ до ручной
+    отмены — и стухшая двухдневная проблема резала лучшие связки ночи
+    (см. _BALANCE_ERROR_MARKERS). Точечные исключения «монета:биржа» за
+    «contract not activated» живут отдельно, в .env, и на них TTL не
+    распространяется — там причина действительно постоянная."""
+    try:
+        return float(os.getenv("BLOCKED_COINS_TTL_HOURS", "24"))
+    except (TypeError, ValueError):
+        return 24.0
+
+
 def record_rollback_failure(coin: str, reason: str) -> bool:
     """Записывает ОДИН реальный откат (нога открылась, вторая — нет) по
     этой монете. Возвращает True, если монета ТОЛЬКО ЧТО достигла порога
     и теперь заблокирована (вызывающий код должен явно уведомить
     пользователя именно в этом случае — см. trade_tool.py)."""
+    if _is_balance_error(reason):
+        print(
+            f"[blocked-coins] {coin.upper()}: откат из-за нехватки баланса/маржи — это состояние "
+            f"счёта, а не монеты; в счётчик блокировки НЕ записываю."
+        )
+        return False
     data = _load()
     coin = coin.upper()
     entry = data.get(coin, {"count": 0, "reasons": [], "blocked": False})
@@ -219,7 +255,20 @@ def record_rollback_failure(coin: str, reason: str) -> bool:
 
 def is_blocked(coin: str) -> bool:
     entry = _load().get(coin.upper())
-    return bool(entry and entry.get("blocked"))
+    if not (entry and entry.get("blocked")):
+        return False
+    # Срок жизни блокировки — см. _block_ttl_hours.
+    last = entry.get("last_failure_at")
+    if last:
+        try:
+            age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 3600.0
+        except ValueError:
+            age_hours = 0.0
+        if age_hours > _block_ttl_hours():
+            clear_block(coin)
+            print(f"[blocked-coins] {coin.upper()}: блокировка старше {_block_ttl_hours():.0f}ч — снята автоматически.")
+            return False
+    return True
 
 
 def get_block_info(coin: str) -> Optional[dict]:
