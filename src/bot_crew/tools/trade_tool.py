@@ -2367,7 +2367,28 @@ class TradeExecutionTool(BaseTool):
             if long_fill_price and short_fill_price and long_fill_price > 0:
                 realized_spread_pct = (short_fill_price - long_fill_price) / long_fill_price * 100
                 min_spread = _min_spread_for_coin(coin, float(os.getenv("TEST_BATCH_MIN_SPREAD", os.getenv("AUTO_TRADE_MIN_SPREAD", "3.0"))))
-                if realized_spread_pct < min_spread:
+                # ДОПУСК НА ПРОСКАЛЬЗЫВАНИЕ (добавлено 2026-09-15, реальный случай
+                # LSK: порог 2.2%, стакан перед ордером показывал >=2.2%, ноги
+                # исполнились на 2.11% — и правило «ниже порога — закрыть обе»
+                # немедленно закрыло уже открытую, полностью захеджированную
+                # позицию: −0.10 USDT комиссий и пересечения стаканов ради того,
+                # чтобы не держать спред на 0.09 пункта хуже задуманного).
+                # Порог входа — фильтр ДО сделки. После исполнения деньги за
+                # вход уже уплачены, и вопрос другой: стоит ли держать? Спред
+                # 2.11% держать стоит ровно так же, как 2.2% (T закрывались в
+                # плюс с 1.3-1.8%). Поэтому закрываем сразу только если рынок
+                # за время исполнения уехал СИЛЬНО — больше допуска: тогда
+                # что-то не так (обвал, кривой стакан), а не шум маркет-ордера.
+                # Что вошло чуть хуже порога — держим и сообщаем об этом.
+                tolerance = float(os.getenv("TRADE_REALIZED_SPREAD_TOLERANCE_PCT", "0.5"))
+                if min_spread - tolerance <= realized_spread_pct < min_spread:
+                    print(
+                        f"[realized-spread-check] {coin.upper()}: фактический спред исполнения "
+                        f"{realized_spread_pct:.2f}% чуть ниже порога {min_spread}% (допуск {tolerance}%) — "
+                        f"это проскальзывание маркет-ордера, позицию ДЕРЖУ: закрывать её сейчас — "
+                        f"гарантированный минус на комиссиях."
+                    )
+                if realized_spread_pct < min_spread - tolerance:
                     print(
                         f"[realized-spread-check] {coin.upper()}: обе ноги открылись, но "
                         f"ФАКТИЧЕСКИЙ спред по ценам исполнения — {realized_spread_pct:.2f}% "

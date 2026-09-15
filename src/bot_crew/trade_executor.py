@@ -152,6 +152,44 @@ def _finalize_open(result: dict, spread_percent, notifier, extra_position_fields
     short_exchange = result.get("short_exchange")
 
     if result["cancelled"]:
+        # ХОЛОСТОЙ КРУГ В ЖУРНАЛ (добавлено 2026-09-15, случай LSK): если
+        # обе ноги успели исполниться и были закрыты сразу (проверка
+        # фактического спреда), это РЕАЛЬНЫЕ деньги — комиссии за четыре
+        # ордера и пересечение двух стаканов (~−0.10 USDT на $25). Раньше
+        # такой круг не попадал ни в журнал, ни в дневной отчёт — потери
+        # были невидимы для статистики. Записываем честно, что знаем.
+        try:
+            long_leg = result.get("long") or {}
+            short_leg = result.get("short") or {}
+            lrb, srb = long_leg.get("rollback") or {}, short_leg.get("rollback") or {}
+            if long_leg.get("price") and short_leg.get("price") and lrb.get("price") and srb.get("price"):
+                la = long_leg.get("amount_coin") or 0
+                sa = short_leg.get("amount_coin") or 0
+                long_pnl = la * (lrb["price"] - long_leg["price"])
+                short_pnl = sa * (short_leg["price"] - srb["price"])
+                fees = sum(x for x in (
+                    long_leg.get("fee_usdt"), short_leg.get("fee_usdt"), lrb.get("fee_usdt"), srb.get("fee_usdt")
+                ) if x) or None
+                trade_ledger.record_trade({
+                    "event": "close",
+                    "coin": result["coin"],
+                    "long_exchange": long_exchange, "short_exchange": short_exchange,
+                    "long_entry_price": long_leg["price"], "short_entry_price": short_leg["price"],
+                    "long_exit_price": lrb["price"], "short_exit_price": srb["price"],
+                    "long_amount_coin": la, "short_amount_coin": sa,
+                    "amount_usdt": long_leg.get("amount_usdt"),
+                    "long_pnl": round(long_pnl, 6), "short_pnl": round(short_pnl, 6),
+                    "gross_pnl": round(long_pnl + short_pnl, 6),
+                    "net_pnl": round(long_pnl + short_pnl - (fees or 0.0), 6),
+                    "fees_known": fees is not None,
+                    "close_reason": f"холостой круг: {result['reason']}",
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                    "holding_seconds": 0,
+                    "cancelled_round_trip": True,
+                })
+        except Exception as exc:
+            print(f"[trade_ledger] не удалось записать холостой круг {result.get('coin')}: {exc}")
         if notifier:
             notifier.notify_error(
                 symbol=result["coin"],
