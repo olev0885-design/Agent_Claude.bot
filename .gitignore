@@ -70,3 +70,6 @@ restart_note.txt
 
 # --- Почтовый ящик для Telegram (scanner.py:_telegram_outbox_loop) — операционное ---
 telegram_outbox/
+
+# --- Маркер «на этой машине бот отключён» (main.py:listen) — только локально ---
+.bot_disabled_here
