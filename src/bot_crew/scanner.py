@@ -259,6 +259,26 @@ class FundingScanner:
         self._last_store_adopt_check: float = 0.0  # см. _position_monitor_loop
         self._rate_limited_log_at: dict = {}  # см. _log_rate_limited
 
+        # ПАМЯТЬ РАННИХ ОТКАЗОВ и СЧЁТЧИК СЕТЕВЫХ СБОЕВ НА ПУТИ ВХОДА
+        # (добавлено 2026-09-15, реальный случай INDEX). Ранняя проверка по
+        # стакану отбивала INDEX 20 раз подряд (стакан −19…−23% при тикере
+        # +4%: либо разные токены под одним тикером, либо мёртвый рынок).
+        # Потом на минуту пропала сеть: проверка по стакану и проверка
+        # истории свечей НЕ ПОЛУЧИЛИ данных и — по своему правилу «нет
+        # данных — не блокируем» — пропустили монету до стадии ордера
+        # впервые за всё время. Спас только последний гейт перед отправкой
+        # (он fail-closed). То есть сбой сети не «помешал зайти», а почти
+        # заставил зайти туда, куда нельзя.
+        #   _recent_early_rejects: coin -> monotonic последнего отказа. Если
+        #   монету недавно отбили по стакану, а сейчас данных нет — это
+        #   отказ, а не «пропускаем».
+        #   _entry_net_failures: времена сетевых сбоев на пути входа (стакан
+        #   не получен). Несколько за минуту = сеть лежит, входить нельзя
+        #   вообще: одна нога пройдёт, вторая утонет в таймауте — и откат
+        #   тонет в том же таймауте.
+        self._recent_early_rejects: dict = {}
+        self._entry_net_failures: list = []
+
         # РАЗОВОЕ ИСКЛЮЧЕНИЕ из правила "1 нога на биржу" (см.
         # busy_exchanges выше) — по явной просьбе пользователя 2026-09-08:
         # "разрешаю сделать разовое исключение для mexc и gate, но только 1
@@ -2228,7 +2248,35 @@ class FundingScanner:
         # реальные секунды на запрос свечей), стаканы там перезапросятся.
         opp["_book_snapshots"] = (long_snapshot, short_snapshot)
         opp["_book_snapshots_at"] = time.monotonic()
-        if long_snapshot is not None and short_snapshot is not None:
+        coin_key = opp["coin"].upper()
+        now_mono = time.monotonic()
+        if long_snapshot is None or short_snapshot is None:
+            # НЕТ ДАННЫХ ПО СТАКАНУ — это сетевой сбой (символ проверен выше,
+            # символа нет — это отдельная ветка внутри _get_book_snapshot).
+            # См. комментарий у _entry_net_failures в __init__.
+            self._entry_net_failures.append(now_mono)
+            window = _get_float_env("SCANNER_NET_FAILURE_WINDOW_SECONDS", 60.0)
+            self._entry_net_failures = [t for t in self._entry_net_failures if now_mono - t <= window]
+            max_failures = _get_int_env("SCANNER_NET_FAILURES_TO_PAUSE", 3)
+            if len(self._entry_net_failures) >= max_failures:
+                self._log_rate_limited(
+                    "net-pause",
+                    f"[entry-guard] {len(self._entry_net_failures)} сетевых сбоев за {window:.0f}с на пути входа "
+                    f"— сеть нестабильна, новые входы приостановлены до затишья.",
+                )
+                return
+            reject_ttl = _get_float_env("SCANNER_EARLY_REJECT_MEMORY_SECONDS", 600.0)
+            last_reject = self._recent_early_rejects.get(coin_key)
+            if last_reject is not None and now_mono - last_reject <= reject_ttl:
+                print(
+                    f"[early-spread-check] {coin_key}: стакан сейчас недоступен, а {(now_mono - last_reject):.0f}с "
+                    f"назад по стакану был отказ — считаю отказом, не пропускаю на удачу."
+                )
+                return
+            # Иначе — прежний fail-open: одиночный сбой по монете без истории
+            # отказов не блокирует сделку из-за ЭТОЙ проверки; финальный гейт
+            # перед ордером всё равно fail-closed.
+        else:
             long_vwap = long_snapshot.get("buy_vwap") or long_snapshot.get("reference_price")
             short_vwap = short_snapshot.get("sell_vwap") or short_snapshot.get("reference_price")
             long_norm = _to_usdt_sync(long_vwap, opp["long_exchange"]) if long_vwap else None
@@ -2236,13 +2284,15 @@ class FundingScanner:
             if long_norm is not None and short_norm is not None and long_norm > 0:
                 real_spread_pct = (short_norm - long_norm) / long_norm * 100
                 if real_spread_pct < self._min_spread_for(opp["coin"]):
+                    self._recent_early_rejects[coin_key] = now_mono
                     print(
-                        f"[early-spread-check] {opp['coin'].upper()}: реальный спред по стакану "
+                        f"[early-spread-check] {coin_key}: реальный спред по стакану "
                         f"{real_spread_pct:.2f}% (порог {self._min_spread_for(opp['coin'])}%, тикер "
                         f"показывал {opp['spread_pct']:.2f}%) — пропускаю до дорогой проверки "
                         f"схождения."
                     )
                     return
+                self._recent_early_rejects.pop(coin_key, None)
 
         # ИСТОРИЯ СХОЖДЕНИЯ СПРЕДА (добавлено 2026-09-07 по явной просьбе
         # пользователя после реального случая с BP: спред между mexc/gate
