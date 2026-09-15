@@ -26,14 +26,18 @@ from bot_crew import position_store  # noqa: E402
 
 
 def bot_processes() -> list:
+    """PID процессов бота. Linux (сервер) — pgrep; Windows (ноутбук) — PowerShell."""
     try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
-             "Where-Object { $_.CommandLine -like '*bot_crew.main*' } | ForEach-Object { $_.ProcessId }"],
-            capture_output=True, text=True, timeout=20,
-        )
-        return [p for p in out.stdout.split() if p.strip().isdigit()]
+        if os.name == "nt":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
+                 "Where-Object { $_.CommandLine -like '*bot_crew.main*' } | ForEach-Object { $_.ProcessId }"],
+                capture_output=True, text=True, timeout=20,
+            )
+        else:
+            out = subprocess.run(["pgrep", "-f", "bot_crew.main --listen"], capture_output=True, text=True, timeout=20)
+        return [p for p in out.stdout.split() if p.strip().isdigit() and int(p) != os.getpid()]
     except Exception as exc:
         return [f"ошибка проверки процесса: {exc}"]
 
