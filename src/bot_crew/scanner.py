@@ -14,6 +14,7 @@
 # =============================================================================
 
 import asyncio
+from collections import deque
 import json
 import os
 import time
@@ -278,6 +279,17 @@ class FundingScanner:
         #   тонет в том же таймауте.
         self._recent_early_rejects: dict = {}
         self._entry_net_failures: list = []
+
+        # СОБСТВЕННАЯ ИСТОРИЯ ЦЕН МОНИТОРА по ногам открытых позиций:
+        # (coin, exchange) -> deque[(monotonic, цена выхода этой ноги)].
+        # Добавлено 2026-09-15 (реальный случай LSK): защита от бури брала
+        # историю ТОЛЬКО из потокового стакана; поток на секунды
+        # переподключился, окно 10с опустело, recent_move_pct вернул None,
+        # а None трактовался как 0% — «спокойно». За 13с до этого та же
+        # защита видела бурю 1.04%. Позиция закрылась по оценке +0.13,
+        # факт −0.02. Монитор тикает непрерывно и ВСЕГДА имеет цену (из
+        # потока или по REST) — эта история не зависит от здоровья потока.
+        self._leg_price_history: dict = {}
 
         # РАЗОВОЕ ИСКЛЮЧЕНИЕ из правила "1 нога на биржу" (см.
         # busy_exchanges выше) — по явной просьбе пользователя 2026-09-08:
@@ -941,17 +953,33 @@ class FundingScanner:
             last_sent = today_str
             _save_last_sent(last_sent)
 
-    def _storm_pct(self, long_exchange: str, short_exchange: str, long_symbol: str, short_symbol: str) -> float:
+    def _storm_pct(self, long_exchange: str, short_exchange: str, long_symbol: str, short_symbol: str, coin: str = None):
         """Максимальный размах цены за последние SCANNER_STORM_WINDOW_SECONDS
-        по двум ногам (см. book_stream.recent_move_pct). 0.0, если потоков
-        нет — тогда защита не мешает, поведение как до её появления."""
+        по двум ногам. Источники — ДВА, объединяются: середина стакана из
+        потока (book_stream.recent_move_pct) и собственная история монитора
+        (_leg_price_history — цена выхода ноги на каждом тике, из потока или
+        по REST). Возвращает None, если хотя бы по одной ноге нет двух точек
+        в окне ни в одном источнике — вызывающий код обязан трактовать это
+        как «неизвестно» и НЕ действовать, а не как «спокойно» (реальный
+        случай LSK 2026-09-15: None считался нулём, закрылись в бурю)."""
         window = _get_float_env("SCANNER_STORM_WINDOW_SECONDS", 10.0)
+        cutoff = time.monotonic() - window
         worst = 0.0
         for ex, sym in ((long_exchange, long_symbol), (short_exchange, short_symbol)):
             ex_id = EXCHANGE_ALIASES.get(ex.lower(), ex.lower())
-            move = book_stream.recent_move_pct(ex_id, sym, window)
-            if move is not None and move > worst:
-                worst = move
+            points = []
+            entry = book_stream._STREAMS.get((ex_id, sym))
+            if entry and entry.get("mids"):
+                points.extend(px for ts, px in entry["mids"] if ts >= cutoff)
+            hist = self._leg_price_history.get(((coin or "").upper(), ex.lower()))
+            if hist:
+                points.extend(px for ts, px in hist if ts >= cutoff)
+            if len(points) < 2:
+                return None
+            move = (max(points) - min(points)) / points[-1] * 100.0 if points[-1] else None
+            if move is None:
+                return None
+            worst = max(worst, move)
         return worst
 
     @staticmethod
@@ -2797,6 +2825,11 @@ class FundingScanner:
             long_exit_norm = _to_usdt_sync(long_exit_price, position.long_exchange)
             short_exit_norm = _to_usdt_sync(short_exit_price, position.short_exchange)
             current_spread = (short_exit_norm - long_exit_norm) / long_exit_norm * 100
+            # История цен монитора для защиты от бури (см. _leg_price_history).
+            tick_now = time.monotonic()
+            for ex_name, px in ((position.long_exchange, long_exit_norm), (position.short_exchange, short_exit_norm)):
+                if px:
+                    self._leg_price_history.setdefault((position.coin.upper(), ex_name.lower()), deque(maxlen=600)).append((tick_now, px))
 
             gross_pnl, net_pnl = self._estimate_total_pnl(position, long_exit_price, short_exit_price)
             if gross_pnl is None:
@@ -2890,8 +2923,18 @@ class FundingScanner:
                 )
                 return False, None
             storm = self._storm_pct(
-                position.long_exchange, position.short_exchange, position.long_symbol, position.short_symbol
+                position.long_exchange, position.short_exchange, position.long_symbol, position.short_symbol,
+                coin=position.coin,
             )
+            if storm is None:
+                # Нет данных о волатильности ни из потока, ни из истории
+                # монитора — это НЕ «спокойно». Пропускаем тик; на следующем
+                # история монитора уже будет (она пишется на каждом тике).
+                self._log_rate_limited(
+                    f"storm-unknown:{position.coin}",
+                    f"[close-guard] {position.coin}: нет данных о волатильности за последние секунды — тик пропускаю.",
+                )
+                return False, None
             storm_cap = _get_float_env("SCANNER_CLOSE_MAX_STORM_PCT", 1.0)
             if storm > storm_cap:
                 self._log_rate_limited(
@@ -3139,6 +3182,10 @@ class FundingScanner:
         # закрываются по очереди, reconcile не должен трактовать уже
         # закрытую первую ногу как «пропавшую».
         self._recent_open_attempts[position.coin.upper()] = time.monotonic()
+        # История цен этой позиции больше не нужна (новая позиция по той же
+        # монете начнёт свою; старые точки за окном и так отсекаются).
+        for key in [k for k in self._leg_price_history if k[0] == position.coin.upper()]:
+            self._leg_price_history.pop(key, None)
         # ПРЯМОЙ await вместо run_in_executor (2026-09-10, по прямой
         # просьбе пользователя "нагружай максимально... сделай
         # параллельным, чтобы закрывались по нужной цене") — этот код и
@@ -3170,7 +3217,13 @@ class FundingScanner:
                 # _should_close): если за миллисекунды между решением и этой
                 # проверкой рынок задёргался — гейт это увидит здесь.
                 min_net_pnl=_get_float_env("SCANNER_CLOSE_PROFIT_BUFFER_USDT", 0.02)
-                + self._storm_pct(position.long_exchange, position.short_exchange, position.long_symbol, position.short_symbol)
+                + (
+                    # None (нет данных) здесь = надбавка как при буре на пороге:
+                    # лучше отменить закрытие и подождать тик, чем закрыться вслепую.
+                    self._storm_pct(position.long_exchange, position.short_exchange, position.long_symbol, position.short_symbol, coin=position.coin)
+                    if self._storm_pct(position.long_exchange, position.short_exchange, position.long_symbol, position.short_symbol, coin=position.coin) is not None
+                    else _get_float_env("SCANNER_CLOSE_MAX_STORM_PCT", 1.0)
+                )
                 / 100.0 * (position.amount_usdt or 0.0) * _get_float_env("SCANNER_CLOSE_VOLATILITY_BUFFER_K", 1.0),
             )
         except Exception as exc:
