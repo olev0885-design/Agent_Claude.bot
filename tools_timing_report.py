@@ -55,6 +55,16 @@ def main():
     else:
         print("  пока нет — появится после первой сделки, открытой сканером")
 
+    # ИСТОЧНИК ВХОДА (2026-09-15): поток bid/ask vs REST-цикл — сколько входов
+    # дал событийный путь и отличается ли задержка.
+    by_src = {}
+    for t in live:
+        by_src.setdefault(t.get("trigger_source") or "rest(до учёта)", []).append(t)
+    if len(by_src) > 1 or "stream" in by_src:
+        print("\n=== ОТКРЫТИЕ ПО ИСТОЧНИКУ ===")
+        for src, items in sorted(by_src.items()):
+            print(f"  {src:<14} n={len(items):<3} ВСЕГО {_fmt(col(items,'total_ms'))}")
+
     if synthetic:
         print("\n=== ОТКРЫТИЕ — В ОБХОД СКАНЕРА (не показатель) ===")
         print(f"  ВСЕГО         : {_fmt(col(synthetic,'total_ms'))}")
