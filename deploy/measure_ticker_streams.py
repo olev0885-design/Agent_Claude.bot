@@ -1,39 +1,55 @@
 # =============================================================================
-# deploy/measure_ticker_streams.py — ЗАМЕР нагрузки потоковых bid/ask по всей
-# торгуемой вселенной (монеты, есть >= на 2 наших биржах). Ничего не торгует.
-# Отвечает: сколько сообщений/сек и CPU съест событийное обнаружение спредов
-# по стакану, если подписаться на всё. Запуск на сервере под nice.
+# deploy/measure_ticker_streams.py — ЗАМЕР нагрузки потоковых цен. Ничего не
+# торгует. v2 (2026-09-15): гибрид вместо «подписаться на всё» — первый замер
+# (906 монет, ~4400 подписок) дал ~480 сообщ/с и 100% одного ядра, bitget
+# отвергал пакеты по 50, mexc не принимает watch_bids_asks без списка.
+#   - mexc / hyperliquid / binance: ВСЕ тикеры одним потоком (watch_tickers());
+#   - gate / bitget / bybit: только «горячий список» из HOT символов, пакетами
+#     по BATCH (bitget не любит большие пакеты).
+# Считаем РЕАЛЬНЫЕ события (изменение bid/ask по символу), а не размер
+# возвращаемых словарей. Запуск на сервере под nice.
 # =============================================================================
 import asyncio, os, sys, time, collections, resource
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 from dotenv import load_dotenv; load_dotenv(os.path.join(ROOT, ".env"))
 import ccxt.pro as ccxtpro
-from bot_crew.tools.trade_tool import EXCHANGE_ALIASES, _build_symbol
+from bot_crew.tools.trade_tool import EXCHANGE_ALIASES
 
 EX = [e.strip() for e in (os.getenv("TEST_BATCH_SAFE_EXCHANGES") or "").split(",") if e.strip()]
 DURATION = float(sys.argv[1]) if len(sys.argv) > 1 else 90.0
-BATCH = 50  # символов на один вызов watch_bids_asks для бирж без «все разом»
+HOT = int(sys.argv[2]) if len(sys.argv) > 2 else 150
+BATCH = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+ALL_AT_ONCE = {"mexc", "hyperliquid", "binance"}
 
-counts = collections.Counter(); last_ts = {}; lat_samples = collections.defaultdict(list); errors = collections.Counter()
+events = collections.Counter(); frames = collections.Counter(); errors = collections.Counter()
+seen = collections.defaultdict(dict)  # ex -> symbol -> (bid, ask)
 
 async def load(n):
     ex = getattr(ccxtpro, EXCHANGE_ALIASES.get(n, n))({"options": {"defaultType": "swap"}, "enableRateLimit": True})
     await ex.load_markets()
-    coins = {m["base"]: m["symbol"] for m in ex.markets.values() if m.get("swap") and m.get("linear") and m.get("active", True)}
-    return n, ex, coins
+    ms = [m for m in ex.markets.values() if m.get("swap") and m.get("linear") and m.get("active", True)]
+    return n, ex, ms
+
+def note(n, sym, t):
+    b, a = t.get("bid"), t.get("ask")
+    if b is None and a is None: return
+    prev = seen[n].get(sym)
+    if prev != (b, a):
+        seen[n][sym] = (b, a); events[n] += 1
 
 async def pump(n, ex, symbols, stop_at):
-    method = "watch_bids_asks" if ex.has.get("watchBidsAsks") else "watch_tickers"
     while time.monotonic() < stop_at:
         try:
-            data = await asyncio.wait_for(getattr(ex, method)(symbols) if symbols else getattr(ex, method)(), timeout=30)
-            now = time.time() * 1000
-            items = data.values() if isinstance(data, dict) else [data]
-            for t in items:
-                counts[n] += 1
-                ts = t.get("timestamp")
-                if ts: lat_samples[n].append(now - ts)
+            if symbols is None:
+                data = await asyncio.wait_for(ex.watch_tickers(), timeout=40)
+            elif ex.has.get("watchBidsAsks"):
+                data = await asyncio.wait_for(ex.watch_bids_asks(symbols), timeout=40)
+            else:
+                data = await asyncio.wait_for(ex.watch_tickers(symbols), timeout=40)
+            frames[n] += 1
+            for sym, t in (data.items() if isinstance(data, dict) else []):
+                note(n, sym, t)
         except asyncio.TimeoutError:
             errors[n + ":timeout"] += 1
         except Exception as e:
@@ -42,21 +58,22 @@ async def pump(n, ex, symbols, stop_at):
 
 async def main():
     loaded = await asyncio.gather(*(load(n) for n in EX))
-    presence = collections.Counter(c for _, _, coins in loaded for c in coins)
-    universe = {c for c, k in presence.items() if k >= 2}
-    print(f"вселенная: {len(universe)} монет на >=2 биржах")
+    presence = collections.Counter(m["base"] for _, _, ms in loaded for m in ms)
     stop_at = time.monotonic() + DURATION
-    tasks = []
-    plan = []
-    for n, ex, coins in loaded:
-        syms = [coins[c] for c in coins if c in universe]
-        all_at_once = n in ("mexc", "hyperliquid", "binance")
-        if all_at_once:
-            plan.append(f"  {n:<12} {len(syms):>4} монет — один поток на все")
+    tasks = []; plan = []
+    for n, ex, ms in loaded:
+        pairable = [m for m in ms if presence[m["base"]] >= 2]
+        if n in ALL_AT_ONCE:
+            plan.append(f"  {n:<12} все тикеры одним потоком ({len(pairable)} парных монет)")
             tasks.append(pump(n, ex, None, stop_at))
         else:
+            # «горячий список»: топ по обороту среди парных — суррогат того, что
+            # в боте будет формироваться из результатов REST-сканера
+            hot = sorted(pairable, key=lambda m: -(float((m.get("info") or {}).get("volume_24h_quote") or 0) if isinstance(m.get("info"), dict) else 0))[:HOT]
+            if len(hot) < HOT: hot = pairable[:HOT]
+            syms = [m["symbol"] for m in hot]
             batches = [syms[i:i+BATCH] for i in range(0, len(syms), BATCH)]
-            plan.append(f"  {n:<12} {len(syms):>4} монет — {len(batches)} пакетов по {BATCH}")
+            plan.append(f"  {n:<12} горячий список {len(syms)} монет — {len(batches)} пакетов по {BATCH}")
             for b in batches:
                 tasks.append(pump(n, ex, b, stop_at))
     print("\n".join(plan)); print(f"\nзамер {DURATION:.0f}с...", flush=True)
@@ -64,12 +81,9 @@ async def main():
     await asyncio.gather(*tasks, return_exceptions=True)
     wall = time.monotonic() - t0; cpu = time.process_time() - cpu0
     print(f"\n=== РЕЗУЛЬТАТ за {wall:.0f}с ===")
-    tot = 0
     for n in EX:
-        c = counts[n]; tot += c
-        lats = sorted(lat_samples[n]); med = lats[len(lats)//2] if lats else float("nan")
-        print(f"  {n:<12} {c/wall:8.1f} сообщ/с   задержка биржа->мы (медиана) {med:6.0f} мс")
-    print(f"  {'ИТОГО':<12} {tot/wall:8.1f} сообщ/с")
+        print(f"  {n:<12} кадров {frames[n]/wall:6.1f}/с   реальных изменений bid/ask {events[n]/wall:7.1f}/с   монет с данными {len(seen[n])}")
+    print(f"  {'ИТОГО':<12} кадров {sum(frames.values())/wall:6.1f}/с   изменений {sum(events.values())/wall:7.1f}/с")
     print(f"  CPU процесса: {cpu/wall*100:.0f}% одного ядра   RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024:.0f} MB")
     if errors: print("  ошибки:", dict(errors))
     for _, ex, _ in loaded:
