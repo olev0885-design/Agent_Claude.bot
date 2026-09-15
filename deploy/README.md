@@ -102,3 +102,15 @@ GitHub → Settings → Deploy keys (Allow write access), remote переклю�
 - Планировщик Windows — заменён cron.
 - Блокировка сна (`SetThreadExecutionState`) — серверу не нужна, код сам
   пропускает её вне Windows.
+
+---
+
+## Выполнено 2026-09-15 — сервер в работе
+
+- **Сервер**: Kamatera, зона AS-TY (Токио), IP `45.130.167.115`, Ubuntu 24.04.4, 2 vCPU Type B, 4 GB, 20 GB. Имя `agentser`.
+- **Доступ**: только по SSH-ключу (`~/.ssh/agent_claude_bot_ed25519` на ноутбуке), root-пароль заменён на случайный (`~/.ssh/agent_claude_bot_root_pw.txt`, только локально), вход по паролю отключён.
+- **Бот**: служба `agent-claude-bot` (enabled, active), код `/opt/agent-claude-bot`, пользователь `bot`. Секреты и учёт перенесены по scp. Бот на ноутбуке остановлен и больше не запускается.
+- **Замер из Токио**: binance 9 мс (приватный; было 469 с ноутбука), gate 59 (288), bitget 78 (309), binance публичный 96 (291), hyperliquid 133 (340), mexc 156 (399), bybit 180 (381). Часы 0.0 с. Гео-блокировок нет (в т.ч. OKX, KuCoin 52 мс, BingX, HTX). Цикл сканера 3–8 с вместо 14.
+- **Claude Code + Remote Control**: установлен под `bot` (v2.1.272), логин olev0885@gmail.com, сессия «Agent Bot Tokyo» в tmux (`sudo -u bot tmux attach -t claude`), служба `claude-remote` поднимает её при загрузке. Доступ: claude.ai/code или приложение Claude → Code.
+- **Код**: правки делаются на ноутбуке и пушатся в GitHub (часовой sync); сервер делает `git pull --ff-only` в :23 каждого часа (cron `bot`). Перезапуск службы после правок — вручную: `systemctl restart agent-claude-bot`.
+- **sudo для `bot`**: только `systemctl start|stop|restart|status agent-claude-bot` и `journalctl -u agent-claude-bot`.
