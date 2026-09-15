@@ -2777,8 +2777,14 @@ class FundingScanner:
                 print(f"[test_batch] {position.coin}: не удалось получить стакан ({type(exc).__name__}: {exc})")
                 return None
 
-            long_bids, long_asks = long_book.get("bids"), long_book.get("asks")
-            short_bids, short_asks = short_book.get("bids"), short_book.get("asks")
+            # Объёмы стакана — в МОНЕТАХ (см. TradeExecutionTool._levels_in_coins,
+            # случай INDEX 2026-09-15: у gate/mexc уровни в контрактах).
+            long_cs = TradeExecutionTool._contract_size(long_client, position.long_symbol)
+            short_cs = TradeExecutionTool._contract_size(short_client, position.short_symbol)
+            long_bids = TradeExecutionTool._levels_in_coins(long_book.get("bids"), long_cs)
+            long_asks = TradeExecutionTool._levels_in_coins(long_book.get("asks"), long_cs)
+            short_bids = TradeExecutionTool._levels_in_coins(short_book.get("bids"), short_cs)
+            short_asks = TradeExecutionTool._levels_in_coins(short_book.get("asks"), short_cs)
             if not long_bids or not long_asks or not short_bids or not short_asks:
                 return None
 
@@ -3035,8 +3041,14 @@ class FundingScanner:
             )
             return False
 
-        long_exit_price = TradeExecutionTool._vwap_from_levels(long_book.get("bids"), position.amount_usdt)
-        short_exit_price = TradeExecutionTool._vwap_from_levels(short_book.get("asks"), position.amount_usdt)
+        long_exit_price = TradeExecutionTool._vwap_from_levels(
+            TradeExecutionTool._levels_in_coins(long_book.get("bids"), TradeExecutionTool._contract_size(long_client, position.long_symbol)),
+            position.amount_usdt,
+        )
+        short_exit_price = TradeExecutionTool._vwap_from_levels(
+            TradeExecutionTool._levels_in_coins(short_book.get("asks"), TradeExecutionTool._contract_size(short_client, position.short_symbol)),
+            position.amount_usdt,
+        )
         if not long_exit_price or not short_exit_price:
             return False
 

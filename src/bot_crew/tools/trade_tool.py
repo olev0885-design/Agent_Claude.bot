@@ -1706,6 +1706,36 @@ class TradeExecutionTool(BaseTool):
         return cached.get("rate") if cached else None
 
     @staticmethod
+    @staticmethod
+    def _levels_in_coins(levels, contract_size) -> list:
+        """Стакан в МОНЕТАХ, а не в контрактах. Добавлено 2026-09-15 (реальный
+        случай INDEX): у gate и mexc объёмы уровней приходят в КОНТРАКТАХ, и
+        у части монет 1 контракт = 100 монет (INDEX, T на mexc, BONER на
+        gate). _vwap_from_levels считал price × amount как будто amount — это
+        монеты, то есть видел стакан в 100 раз тоньше реального, «проходил»
+        $25 на десятки уровней вглубь и получал фантомные −12…−22% там, где
+        реальный спред исполнения был +3%. INDEX отвергался 375 раз за день.
+        Для бирж с contractSize=1 (bybit/bitget/binance/hyperliquid) — no-op."""
+        try:
+            cs = float(contract_size or 1)
+        except (TypeError, ValueError):
+            cs = 1.0
+        if not levels or cs == 1.0:
+            return list(levels or [])
+        out = []
+        for level in levels:
+            if len(level) >= 2 and level[0] and level[1]:
+                out.append((level[0], level[1] * cs))
+        return out
+
+    @staticmethod
+    def _contract_size(exchange, symbol: str):
+        try:
+            return (exchange.market(symbol) or {}).get("contractSize") or 1
+        except Exception:
+            return 1
+
+    @staticmethod
     def _vwap_from_levels(levels, amount_usdt: float) -> Optional[float]:
         """Общая логика "прохода" (walking) по одной стороне стакана
         (bids ИЛИ asks) до набора нужного объёма в USDT — вынесена в
@@ -1843,11 +1873,17 @@ class TradeExecutionTool(BaseTool):
         if streamed is not None:
             bids, asks = streamed.get("bids"), streamed.get("asks")
             if bids and asks and bids[0] and asks[0]:
+                # contractSize — из персистентного клиента (кэш рынков, 0мс).
+                try:
+                    cs = self._contract_size(await self._get_ready_client(exchange_name), symbol)
+                except Exception:
+                    cs = 1
+                bids_c, asks_c = self._levels_in_coins(bids, cs), self._levels_in_coins(asks, cs)
                 best_bid, best_ask = bids[0][0], asks[0][0]
                 return {
                     "reference_price": (best_bid + best_ask) / 2 if best_bid and best_ask else None,
-                    "buy_vwap": self._vwap_from_levels(asks, amount_usdt),
-                    "sell_vwap": self._vwap_from_levels(bids, amount_usdt),
+                    "buy_vwap": self._vwap_from_levels(asks_c, amount_usdt),
+                    "sell_vwap": self._vwap_from_levels(bids_c, amount_usdt),
                     "source": "поток",
                 }
 
@@ -1876,10 +1912,11 @@ class TradeExecutionTool(BaseTool):
                 return None
             best_bid, best_ask = bids[0][0], asks[0][0]
             reference_price = (best_bid + best_ask) / 2 if best_bid and best_ask else None
+            cs = self._contract_size(exchange, symbol)
             return {
                 "reference_price": reference_price,
-                "buy_vwap": self._vwap_from_levels(asks, amount_usdt),   # LONG (покупка) — идём по asks
-                "sell_vwap": self._vwap_from_levels(bids, amount_usdt),  # SHORT (продажа) — идём по bids
+                "buy_vwap": self._vwap_from_levels(self._levels_in_coins(asks, cs), amount_usdt),   # LONG (покупка) — идём по asks
+                "sell_vwap": self._vwap_from_levels(self._levels_in_coins(bids, cs), amount_usdt),  # SHORT (продажа) — идём по bids
                 "source": "REST",
             }
         except Exception as exc:
