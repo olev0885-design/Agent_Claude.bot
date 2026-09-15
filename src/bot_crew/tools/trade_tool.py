@@ -612,6 +612,22 @@ async def _resolve_fill_price(exchange, order: dict, symbol: str, exchange_id: s
     order_id = order.get("id")
     if not order_id:
         return None
+    # ПОТОК ОРДЕРОВ — ПЕРВЫМ (2026-09-15): если биржа не положила среднюю
+    # цену в ответ на создание, она почти наверняка уже пришла по WebSocket
+    # (private_stream хранит последние ордера по id). 0мс вместо REST
+    # fetch_order (+0.2с пауза и второй запрос в худшем случае).
+    try:
+        for stream_key in {exchange_id, getattr(exchange, "id", exchange_id)}:
+            streamed = private_stream.get_order(stream_key, order_id)
+            if streamed:
+                for key in ("fee", "fees", "cost", "filled", "average"):
+                    if streamed.get(key) is not None and order.get(key) is None:
+                        order[key] = streamed[key]
+                price = streamed.get("average") or streamed.get("price")
+                if price:
+                    return price
+    except Exception:
+        pass
     verify_params = {"uta": False} if exchange_id == "bitget" else {}
     if exchange_id == "bybit":
         verify_params["acknowledged"] = True
@@ -1419,6 +1435,7 @@ class TradeExecutionTool(BaseTool):
         # _build_symbol/EXCHANGE_QUOTE_CURRENCY: Hyperliquid — USDC,
         # остальные — USDT). Общий символ на обе ноги был бы неверен, если
         # long и short — на разных по этому признаку биржах.
+        leg_started = time.monotonic()  # замер этой ноги отдельно (см. [timing] ноги)
         symbol = _build_symbol(exchange_name, coin)
 
         # exchange создаём ВНУТРИ try (а не до него), т.к. сама сборка
@@ -1632,6 +1649,7 @@ class TradeExecutionTool(BaseTool):
                 "price": fill_price,
                 "filled_amount_coin": filled_contracts * contract_size,
                 "actual_amount_usdt": amount_usdt,
+                "leg_ms": round((time.monotonic() - leg_started) * 1000, 1),
             }
         except UnsupportedExchangeError as exc:
             # Биржа названа в сигнале, но её нет в CCXT (например, OURBIT).
@@ -2355,6 +2373,10 @@ class TradeExecutionTool(BaseTool):
 
         elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
         timings["orders_ms"] = elapsed_ms
+        # По ногам отдельно: orders_ms — это МАКСИМУМ из двух параллельных ног,
+        # и без разбивки не видно, какая биржа тормозит.
+        timings["long_leg_ms"] = long_result.get("leg_ms")
+        timings["short_leg_ms"] = short_result.get("leg_ms")
         phase_start = time.monotonic()
 
         # amount_in_coin нужен боту позже, чтобы ЗАКРЫТЬ ровно тот же объём
@@ -2669,9 +2691,13 @@ class TradeExecutionTool(BaseTool):
                 f"стакан ГОТОВЫЙ из сканера, источник {book_source}" if reused
                 else "стакан ЗАПРОШЕН здесь — НЕ боевой путь"
             )
+            legs = ""
+            if timings.get("long_leg_ms") is not None or timings.get("short_leg_ms") is not None:
+                legs = (f" [ноги: {long_exchange} {timings.get('long_leg_ms') or 0:.0f}мс / "
+                        f"{short_exchange} {timings.get('short_leg_ms') or 0:.0f}мс]")
             print(
                 f"[timing] {coin.upper()} ОТКРЫТИЕ: стакан {timings.get('book_snapshot_ms', 0)}мс ({source}) + "
-                f"проверки {timings.get('pre_order_checks_ms', 0)}мс + ордера {timings.get('orders_ms', 0)}мс + "
+                f"проверки {timings.get('pre_order_checks_ms', 0)}мс + ордера {timings.get('orders_ms', 0)}мс{legs} + "
                 f"комиссии {timings.get('fee_lookup_ms', 0)}мс = {timings['total_ms']}мс всего"
             )
         except Exception as exc:
@@ -2810,6 +2836,7 @@ class TradeExecutionTool(BaseTool):
     async def _close_single_order(
         self, exchange_name: str, coin: str, original_side: str, amount_in_coin: float
     ) -> dict:
+        leg_started = time.monotonic()  # замер этой ноги отдельно (см. [timing] ноги)
         symbol = _build_symbol(exchange_name, coin)  # см. _place_single_order — своя валюта котировки на биржу
         close_side = "sell" if original_side == "long" else "buy"
         exchange = None
@@ -3044,6 +3071,7 @@ class TradeExecutionTool(BaseTool):
                 "status": "OK",
                 "order_id": order.get("id"),
                 "price": price,
+                "leg_ms": round((time.monotonic() - leg_started) * 1000, 1),
             }
         except UnsupportedExchangeError as exc:
             return {
@@ -3097,6 +3125,8 @@ class TradeExecutionTool(BaseTool):
 
         elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
         timings["orders_ms"] = elapsed_ms
+        timings["long_leg_ms"] = long_result.get("leg_ms")
+        timings["short_leg_ms"] = short_result.get("leg_ms")
         phase_start = time.monotonic()
 
         # Комиссии за ВЫХОД — те же рыночные (taker) ордера, что и на
@@ -3122,8 +3152,12 @@ class TradeExecutionTool(BaseTool):
         try:
             timings["fee_lookup_ms"] = round((time.monotonic() - phase_start) * 1000, 1)
             timings["total_ms"] = _timings_total_ms(timings)
+            legs = ""
+            if timings.get("long_leg_ms") is not None or timings.get("short_leg_ms") is not None:
+                legs = (f" [ноги: {long_exchange} {timings.get('long_leg_ms') or 0:.0f}мс / "
+                        f"{short_exchange} {timings.get('short_leg_ms') or 0:.0f}мс]")
             print(
-                f"[timing] {coin.upper()} ЗАКРЫТИЕ: ордера {timings['orders_ms']}мс + "
+                f"[timing] {coin.upper()} ЗАКРЫТИЕ: ордера {timings['orders_ms']}мс{legs} + "
                 f"комиссии {timings['fee_lookup_ms']}мс = {timings['total_ms']}мс всего"
             )
         except Exception as exc:
