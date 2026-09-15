@@ -27,7 +27,9 @@ def _fmt(values):
 
 
 def main():
-    rows = [t for t in trade_ledger.read_all() if t.get("timings")]
+    all_rows = trade_ledger.read_all()
+    all_closes = [t for t in all_rows if t.get("event") != "open"]
+    rows = [t for t in all_rows if t.get("timings")]
     if not rows:
         print("В журнале ещё нет сделок с разбивкой задержек.")
         return
@@ -62,6 +64,26 @@ def main():
     print(f"  ордера        : {_fmt(col(closes,'orders_ms'))}")
     print(f"  комиссии      : {_fmt(col(closes,'fee_lookup_ms'))}")
     print(f"  ВСЕГО         : {_fmt(col(closes,'total_ms'))}")
+
+    # ОЖИДАЛИ vs ПОЛУЧИЛИ (добавлено 2026-09-15): оценка чистого PnL на момент
+    # решения о закрытии — в close_reason («оценка чистого PnL +X» или
+    # «чистая прибыль +X»), факт — net_pnl. Разрыв между ними — главный
+    # сигнал проблем исполнения (обвал за секунду, тонкий стакан, задержка).
+    import re
+    import statistics
+    gaps = []
+    for t in all_closes:
+        reason = t.get("close_reason") or ""
+        m = re.search(r"(?:оценка чистого PnL|чистая прибыль) ([+-]?\d+\.\d+)", reason)
+        if m and t.get("net_pnl") is not None:
+            est = float(m.group(1)); real = float(t["net_pnl"])
+            gaps.append(((t.get("closed_at") or "")[:16], t.get("coin"), est, real, real - est))
+    if gaps:
+        print("\n=== ЗАКРЫТИЕ: ОЖИДАЛИ vs ПОЛУЧИЛИ (USDT) ===")
+        for ts, coin, est, real, gap in gaps[-12:]:
+            flag = "  <-- разрыв" if gap < -0.08 else ""
+            print(f"  {ts} {coin:<8} оценка {est:+.3f}  факт {real:+.3f}  разрыв {gap:+.3f}{flag}")
+        print(f"  медиана разрыва: {statistics.median(g[4] for g in gaps):+.3f}   n={len(gaps)}")
 
 
 if __name__ == "__main__":

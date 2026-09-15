@@ -2998,6 +2998,16 @@ class FundingScanner:
         for r in results:
             should_close, forced_reason = _should_close(r)
             if should_close:
+                # ОЦЕНКА PnL НА МОМЕНТ РЕШЕНИЯ — в причину закрытия (2026-09-15):
+                # разрыв «ожидали/получили» — главный сигнал проблем (MTL: +0.25
+                # -> −0.28; LSK: +0.13 -> −0.02), а у обычных закрытий его в
+                # журнале не было. Теперь есть у всех.
+                estimate = r[3]
+                if forced_reason is None:
+                    forced_reason = (
+                        f"спред сошёлся до {r[1]:.2f}% (тестовая серия)"
+                        + (f", оценка чистого PnL {estimate:+.4f} USDT" if estimate is not None else "")
+                    )
                 candidates.append((r[0], r[1], forced_reason))
         if candidates:
             await asyncio.gather(
