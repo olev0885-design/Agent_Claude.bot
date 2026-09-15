@@ -34,6 +34,7 @@ from bot_crew import private_stream
 # См. book_stream.py — потоковые стаканы; _get_book_snapshot сначала
 # смотрит туда и лишь при отсутствии/устаревании идёт по REST.
 from bot_crew import book_stream
+from bot_crew import price_stream
 # См. _persist_provisional_position — запись позиции в учёт СРАЗУ после
 # исполнения обеих ног, до любой косметики (инцидент BONER 2026-09-15).
 from bot_crew import position_store
@@ -1882,7 +1883,7 @@ class TradeExecutionTool(BaseTool):
         return free
 
     async def _get_book_snapshot(
-        self, exchange_name: str, coin: str, amount_usdt: float
+        self, exchange_name: str, coin: str, amount_usdt: float, side: Optional[str] = None
     ) -> Optional[dict]:
         """ОДИН запрос стакана (fetch_order_book), который отдаёт ВСЁ,
         что нужно перед входом: и цену для проверки направления, и VWAP
@@ -1918,6 +1919,34 @@ class TradeExecutionTool(BaseTool):
         # честно идём по REST ниже, торговая логика не меняется.
         symbol = _build_symbol(exchange_name, coin)
         exchange_id = EXCHANGE_ALIASES.get(exchange_name.lower(), exchange_name.lower())
+
+        # БЫСТРЫЙ ПУТЬ ПО ВЕРХУ СТАКАНА (2026-09-15): поток bid/ask горячего
+        # списка отдаёт и ОБЪЁМ лучшего уровня. Если он покрывает наш объём с
+        # запасом (PRICE_STREAM_TOP_COVER_RATIO), то VWAP на нашу сумму — это
+        # ровно лучшая цена, и полный стакан запрашивать незачем (0мс вместо
+        # 10–180мс REST). Объёмы у бирж в контрактах — приводим через
+        # contractSize. Если верх тонкий — идём за глубиной ниже, как раньше.
+        top = price_stream.get(exchange_name, symbol)
+        if top and top.get("bid_size") and top.get("ask_size"):
+            try:
+                cs = self._contract_size(await self._get_ready_client(exchange_name), symbol)
+                ratio = float(os.getenv("PRICE_STREAM_TOP_COVER_RATIO", "2.0"))
+                bid_usd = float(top["bid"]) * float(top["bid_size"]) * float(cs or 1)
+                ask_usd = float(top["ask"]) * float(top["ask_size"]) * float(cs or 1)
+                # side: "buy" — нам нужна только покупка (asks, длинная нога),
+                # "sell" — только продажа (bids, короткая). None — обе стороны.
+                need_ask = side in (None, "buy")
+                need_bid = side in (None, "sell")
+                if (not need_bid or bid_usd >= amount_usdt * ratio) and (not need_ask or ask_usd >= amount_usdt * ratio):
+                    return {
+                        "reference_price": (top["bid"] + top["ask"]) / 2,
+                        "buy_vwap": top["ask"],
+                        "sell_vwap": top["bid"],
+                        "source": "верх стакана",
+                    }
+            except Exception:
+                pass  # любой сбой быстрого пути — просто идём обычным
+
         streamed = book_stream.get_book(exchange_id, symbol)
         if streamed is not None:
             bids, asks = streamed.get("bids"), streamed.get("asks")

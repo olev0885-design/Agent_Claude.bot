@@ -120,7 +120,11 @@ async def _pump(exchange_name: str, batch_id: int) -> None:
                 prev = prices.get(sym)
                 if prev and prev["bid"] == bid and prev["ask"] == ask:
                     continue
-                prices[sym] = {"bid": bid, "ask": ask, "ts": now}
+                # Объёмы лучших уровней — для быстрого VWAP без запроса стакана
+                # (см. trade_tool._get_book_snapshot): если верх стакана покрывает
+                # наш объём, лучшая цена и есть цена исполнения.
+                prices[sym] = {"bid": bid, "ask": ask, "ts": now,
+                               "bid_size": t.get("bidVolume"), "ask_size": t.get("askVolume")}
                 for cb in _ON_UPDATE:
                     try:
                         cb(exchange_name, sym)

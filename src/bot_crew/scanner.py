@@ -575,6 +575,12 @@ class FundingScanner:
                     # это чистая подготовка на будущее, она не должна ни на
                     # миллисекунду задерживать текущий цикл или сделку.
                     asyncio.create_task(self._warm_leverage_for_candidates(opportunities))
+                    # ПРОГРЕВ ИСТОРИИ СХОЖДЕНИЯ (2026-09-15): самый дорогой шаг пути
+                    # входа для пары, не виденной 10 минут, — 1–5с REST-свечей с
+                    # двух бирж. Считаем заранее для связок вблизи порога, чтобы в
+                    # момент входа ответ был из кэша (0мс). Ограничено по числу
+                    # пар за цикл — это фоновая работа, не гонка.
+                    asyncio.create_task(self._warm_convergence_for_candidates(opportunities))
                     # ПОТОКОВЫЙ СТАКАН ДЛЯ КАНДИДАТОВ (добавлено 2026-09-14 по
                     # прямой просьбе пользователя "можем ли всё сделать на
                     # веб-сокете") — тот же принцип, что и прогрев плеча:
@@ -2345,8 +2351,10 @@ class FundingScanner:
         # конкретной проверки, если данных просто не удалось получить.
         book_tool = TradeExecutionTool()
         long_snapshot, short_snapshot = await asyncio.gather(
-            book_tool._get_book_snapshot(opp["long_exchange"], opp["coin"], self.test_batch.amount_usdt),
-            book_tool._get_book_snapshot(opp["short_exchange"], opp["coin"], self.test_batch.amount_usdt),
+            # side — чтобы быстрый путь по верху стакана требовал покрытия только
+            # нужной стороны: длинная нога покупает (asks), короткая продаёт (bids).
+            book_tool._get_book_snapshot(opp["long_exchange"], opp["coin"], self.test_batch.amount_usdt, side="buy"),
+            book_tool._get_book_snapshot(opp["short_exchange"], opp["coin"], self.test_batch.amount_usdt, side="sell"),
         )
         # ПЕРЕДАЁМ СНИМКИ ДАЛЬШЕ (добавлено 2026-09-14): ровно эти же стаканы
         # нужны потом внутри _open_both_legs_async (направление входа +
@@ -2673,6 +2681,39 @@ class FundingScanner:
     # позиций серии ОДНОВРЕМЕННО (asyncio.gather, без последовательных
     # задержек) проверяет текущий спред и закрывает те, что достигли цели.
     # -------------------------------------------------------------------
+    async def _warm_convergence_for_candidates(self, opportunities: list) -> None:
+        """Заранее прогоняет _check_spread_has_converged_recently для связок в
+        пределах CONVERGENCE_WARM_MARGIN_PCT от порога входа — результат ложится
+        в её кэш (SCANNER_CONVERGENCE_CACHE_TTL_SECONDS), и реальный вход
+        проходит этот шаг за 0мс вместо 1–5с. Не больше CONVERGENCE_WARM_MAX_
+        PER_CYCLE пар за цикл, только те, чей кэш пуст или протух; ошибки
+        гасятся — это подготовка, а не решение."""
+        if not opportunities or self.test_batch is None:
+            return
+        margin = _get_float_env("CONVERGENCE_WARM_MARGIN_PCT", 0.8)
+        limit = _get_int_env("CONVERGENCE_WARM_MAX_PER_CYCLE", 3)
+        ttl = _get_float_env("SCANNER_CONVERGENCE_CACHE_TTL_SECONDS", 180.0)
+        now = time.monotonic()
+        done = 0
+        for opp in sorted(opportunities, key=lambda o: o.get("spread_pct", 0), reverse=True):
+            if done >= limit:
+                break
+            coin = opp.get("coin")
+            if not coin or opp.get("spread_pct", 0) < self._min_spread_for(coin) - margin:
+                continue
+            long_ex, short_ex = (opp.get("long_exchange") or "").lower(), (opp.get("short_exchange") or "").lower()
+            if long_ex not in self.test_batch_safe_exchanges or short_ex not in self.test_batch_safe_exchanges:
+                continue
+            cached = self._convergence_cache.get((coin.upper(), long_ex, short_ex))
+            if cached is not None and now - cached[0] < ttl * 0.8:
+                continue  # кэш свежий — греть нечего
+            try:
+                await self._check_spread_has_converged_recently(coin, long_ex, short_ex)
+                done += 1
+                print(f"[convergence-warm] {coin}/{long_ex}-{short_ex}: история схождения посчитана заранее.")
+            except Exception as exc:
+                print(f"[convergence-warm] {coin}: не удалось ({type(exc).__name__}: {exc}).")
+
     async def _warm_leverage_for_candidates(self, opportunities: list) -> None:
         """Заранее выставляет плечо на биржах для монет, в которые мы РЕАЛЬНО
         можем зайти в ближайшее время — чтобы вход не платил за set_leverage
