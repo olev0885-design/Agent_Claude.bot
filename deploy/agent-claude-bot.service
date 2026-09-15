@@ -1,0 +1,40 @@
+# =============================================================================
+# systemd-служба бота. Заменяет собой сразу три вещи с ноутбука:
+#   - ручной запуск через Start-Process,
+#   - watchdog.ps1 (Restart=always перезапустит процесс при любом падении),
+#   - SetThreadExecutionState (серверу спать не нужно).
+# Логи — в listen.log (его читают tools_status.py и часовые проверки) И в
+# journald (journalctl -u agent-claude-bot -f) одновременно.
+# =============================================================================
+[Unit]
+Description=Agent Claude arbitrage bot (scanner + trading)
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/agent-claude-bot
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/agent-claude-bot/venv/bin/python -u -m bot_crew.main --listen
+# Бот сам переживает обрывы Telegram/сети (main.py: супервизор), но если
+# процесс всё же упал — поднимаем через 10с, без ограничения числа попыток.
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+# Мягкая остановка: SIGINT = KeyboardInterrupt — бот завершится штатно.
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=append:/opt/agent-claude-bot/listen.log
+StandardError=append:/opt/agent-claude-bot/listen_err.log
+
+# Минимальная изоляция: бот не пишет никуда, кроме своей папки.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/agent-claude-bot
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
