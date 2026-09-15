@@ -1284,6 +1284,28 @@ class TradeExecutionTool(BaseTool):
             print(f"[okx] Не удалось проверить/выставить net_mode: {exc}")
 
     @staticmethod
+    async def _ensure_bingx_one_way_mode(exchange, exchange_name: str, symbol: str) -> None:
+        """BingX (добавлен 2026-09-15): новый аккаунт создаётся в Hedge-режиме
+        (двусторонние позиции), и тогда ордер с positionSide=BOTH, который
+        CCXT шлёт по умолчанию, падает с 109400 "In the Hedge mode, the
+        'PositionSide' field can only be set to LONG or SHORT" (проверено
+        тестовым ордером с сервера). Наш код везде one-way (buy=long,
+        sell=short, reduceOnly=закрыть) — переключаем аккаунт один раз за
+        запуск. Возможно только без открытых позиций; при отказе просто
+        логируем — ордер потом упадёт тем же понятным 109400."""
+        cache_key = exchange_name.lower()
+        if cache_key in _position_mode_synced:
+            return
+        try:
+            mode = await exchange.fetch_position_mode(symbol)
+            if mode.get("hedged"):
+                await exchange.set_position_mode(False, symbol)
+                print("[bingx] режим позиций переключён Hedge -> One-way.")
+            _position_mode_synced.add(cache_key)
+        except Exception as exc:
+            print(f"[bingx] Не удалось проверить/выставить one-way режим: {exc}")
+
+    @staticmethod
     async def _set_leverage_with_fallback(exchange, leverage: int, symbol: str, leverage_params: dict) -> int:
         """Выставляет плечо с автоматическим откатом на МЕНЬШЕЕ, если
         запрошенное биржа не разрешает для этого символа прямо сейчас —
@@ -1455,6 +1477,16 @@ class TradeExecutionTool(BaseTool):
             # Тот же UTA — форсируем classic-эндпоинт и для set_leverage,
             # для консистентности со всеми остальными bitget-вызовами.
             leverage_params = {"uta": False}
+        elif exchange_id == "bingx":
+            # BingX: one-way режим аккаунта (см. _ensure_bingx_one_way_mode),
+            # cross-маржа — отдельный вызов на символ, плечо — с side=BOTH
+            # (в one-way это единственно допустимое значение).
+            await self._ensure_bingx_one_way_mode(exchange, exchange_name, symbol)
+            try:
+                await exchange.set_margin_mode("cross", symbol)
+            except ccxt_async.ExchangeError as exc:
+                print(f"[margin] bingx {symbol}: не удалось выставить cross ({exc}) — продолжаю с текущим режимом.")
+            leverage_params = {"side": "BOTH"}
         elif exchange_id == "okx":
             # OKX: set_leverage обязан получить mgnMode (иначе ArgumentsRequired
             # marginMode) — cross, как везде; заодно one-way режим аккаунта.
