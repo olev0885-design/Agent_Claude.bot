@@ -265,6 +265,55 @@ def _min_spread_for_coin(coin: str, default: float) -> float:
     return _coin_min_spread_overrides().get((coin or "").upper(), default)
 
 
+# =============================================================================
+# МЯГКИЙ СБРОС СЕТЕВОЙ СЕССИИ ПОСЛЕ СЕТЕВОЙ ОШИБКИ (добавлено 2026-09-15).
+# =============================================================================
+# Проблема: клиенты бота — персистентные (одно aiohttp-соединение на биржу
+# живёт часами). Когда Wi-Fi моргает, TCP-соединение умирает МОЛЧА (без
+# FIN), aiohttp этого не знает и отдаёт мёртвый сокет следующему запросу —
+# тот висит до таймаута (15с). За два лога: 91 RequestTimeout от gate, то
+# есть 91 × 15с = почти 23 минуты циклов сканера и сверки, потраченных на
+# ожидание заведомо мёртвого сокета УЖЕ ПОСЛЕ того, как сеть вернулась.
+#
+# Лечение: при сетевой ошибке закрыть у клиента ТОЛЬКО aiohttp-сессию и
+# коннектор (все пулы сокетов), оставив сам объект биржи с загруженными
+# рынками. Следующий запрос откроет свежее соединение (ccxt делает это
+# лениво в open()). Полный exchange.close() здесь НЕ подходит: он ставит
+# closed_by_user=True, после чего ccxt отказывается открываться заново.
+# Ограничение частоты — не чаще раза в 20с на биржу, чтобы шторм ошибок
+# не превращался в шторм пересозданий.
+_NETWORK_ERROR_NAMES = ("RequestTimeout", "NetworkError", "ExchangeNotAvailable", "DDoSProtection", "InvalidNonce")
+_LAST_SESSION_RESET: dict = {}
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    return type(exc).__name__ in _NETWORK_ERROR_NAMES or "Timeout" in type(exc).__name__
+
+
+async def reset_network_session(exchange, exchange_name: str, exc: BaseException = None) -> bool:
+    """Сбросить пул соединений клиента после сетевой ошибки. Возвращает
+    True, если сброс сделан. Безопасно вызывать откуда угодно — любые
+    собственные ошибки глушит (это вспомогательная гигиена, не логика)."""
+    if exchange is None or (exc is not None and not _is_network_error(exc)):
+        return False
+    now = time.monotonic()
+    if now - _LAST_SESSION_RESET.get(exchange_name, 0.0) < 20.0:
+        return False
+    _LAST_SESSION_RESET[exchange_name] = now
+    try:
+        session = getattr(exchange, "session", None)
+        if session is not None and getattr(exchange, "own_session", True):
+            await session.close()
+        exchange.session = None
+        if hasattr(exchange, "close_connector"):
+            await exchange.close_connector()
+        print(f"[net-reset] {exchange_name}: сетевая ошибка — пул соединений сброшен, следующий запрос откроет новое.")
+        return True
+    except Exception as reset_exc:
+        print(f"[net-reset] {exchange_name}: сброс сессии не удался ({type(reset_exc).__name__}: {reset_exc}).")
+        return False
+
+
 def _timings_total_ms(timings: dict) -> float:
     """Сумма ТОЛЬКО числовых полей *_ms. Раньше здесь было sum(timings.values())
     — и 2026-09-15 это стоило реальных денег: в словарь замеров добавили
@@ -1926,6 +1975,7 @@ class TradeExecutionTool(BaseTool):
             # вручную, воспроизводя вызов отдельным скриптом. Теперь
             # причина видна сразу в логе бота.
             print(f"[book-snapshot] {exchange_name}/{coin}: {type(exc).__name__}: {exc}")
+            await reset_network_session(exchange, exchange_name, exc)
             return None
         finally:
             # См. _get_ready_client — персистентный клиент не закрываем.

@@ -34,6 +34,7 @@ from bot_crew.config import load_auto_trade_config, load_test_batch_config
 from bot_crew import test_batch as test_batch_mod
 from bot_crew.test_batch import TestBatchTracker
 from bot_crew.tools.trade_tool import (
+    reset_network_session,
     _min_spread_for_coin,
     EXCHANGE_ALIASES,
     EXCHANGE_QUOTE_CURRENCY,
@@ -1170,6 +1171,10 @@ class FundingScanner:
                 )
             except Exception as exc:
                 print(f"[reconcile] {exchange_name}: не удалось проверить позиции ({type(exc).__name__}: {exc}).")
+                try:
+                    await reset_network_session(await tool._get_ready_client(exchange_name), exchange_name, exc)
+                except Exception:
+                    pass
                 continue
             checked_exchanges += 1
             if source == "поток":
@@ -1771,6 +1776,9 @@ class FundingScanner:
             return result
         except Exception as exc:
             print(f"[scanner] {exchange_id}: сбой сбора данных ({type(exc).__name__}: {exc}) — пропускаю биржу в этом цикле.")
+            # См. trade_tool.reset_network_session — не оставляем мёртвые
+            # сокеты в пуле до следующего 15-секундного таймаута.
+            await reset_network_session(exchange, exchange_id, exc)
             return {}
 
     @staticmethod
