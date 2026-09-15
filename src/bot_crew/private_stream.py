@@ -68,6 +68,22 @@ _STREAMS: dict = {}
 # КАЖДОМ прогоне и залил бы лог одинаковыми сообщениями.
 _FAILED: set = set()
 
+# Биржи, где ccxt формально заявляет watchPositions, но реальная подписка
+# отвергается сервером. KuCoin Futures (проверено с сервера 2026-09-15,
+# ccxt 4.5.75): watch_positions шлёт подписку positionAll на НОВЫЙ UTA-
+# эндпоинт wsapi-push.kucoin.com, а классический фьючерсный аккаунт
+# отвечает {"result": false, "message": "invalid request data"}; ошибка
+# уходит в приёмный цикл, наш await висит до таймаута → «обрыв» → пересев
+# по REST → снова, каждые несколько секунд. Поток ОРДЕРОВ у kucoin идёт по
+# классическому каналу /contractMarket/tradeOrders и работает — его не
+# трогаем. Можно переопределить через PRIVATE_STREAM_POSITIONS_SKIP.
+_POSITIONS_UNSUPPORTED_DEFAULT = "kucoin"
+
+
+def _positions_skipped(exchange_name: str) -> bool:
+    raw = os.getenv("PRIVATE_STREAM_POSITIONS_SKIP", _POSITIONS_UNSUPPORTED_DEFAULT)
+    return exchange_name.lower() in {x.strip().lower() for x in raw.split(",") if x.strip()}
+
 # Сколько последних ордеров помним в памяти. Нужен только для сверки
 # "исполнился ли ордер, который мы только что отправили" — окно в
 # несколько сотен с огромным запасом покрывает любой реальный темп бота,
@@ -324,7 +340,7 @@ async def subscribe(exchange_name: str, build_client) -> None:
         _STREAMS[exchange_name] = state
 
         started = []
-        if _positions_enabled() and exchange.has.get("watchPositions"):
+        if _positions_enabled() and exchange.has.get("watchPositions") and not _positions_skipped(exchange_name):
             task = asyncio.create_task(_positions_pump(exchange_name, exchange))
             state["positions_task"] = task
             state["tasks"].append(task)
