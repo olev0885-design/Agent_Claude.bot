@@ -87,6 +87,14 @@ def _get_list_env(name: str, default: str) -> list[str]:
 # ту же шкалу для порога в .env, без пересчёта в APR.
 
 
+def _rest_book_limit(client) -> int:
+    """Глубина REST-стакана: 50 везде, но KuCoin Futures жёстко требует
+    РОВНО 20 или 100 (иначе BadRequest, который в мониторе закрытия молча
+    превращался в «нет данных» — см. тот же случай в trade_tool.
+    _get_book_snapshot, PORTAL 2026-09-09)."""
+    return 100 if getattr(client, "id", "") == "kucoinfutures" else 50
+
+
 class FundingScanner:
     """Периодически опрашивает несколько бирж (SCANNER_EXCHANGES), ищет
     пары одинаковых монет с ценовым спредом и/или аномальным фандингом,
@@ -655,10 +663,19 @@ class FundingScanner:
     async def _get_client(self, exchange_id: str):
         if exchange_id in self._clients:
             return self._clients[exchange_id]
-        if not hasattr(ccxt_async, exchange_id):
+        # KuCoin (2026-09-15, при возврате биржи после переезда): класс CCXT
+        # "kucoin" — СПОТ; с defaultType=swap он загружает и перпетуалы, но
+        # fetch_tickers по ним отдаёт bid/ask=None для всех 687 контрактов и
+        # fetch_bids_asks не умеет — спред считался бы по last, что для
+        # решения о входе непригодно. "kucoinfutures" отдаёт bulk bid/ask
+        # (685 из 687, ~370мс). Ключ в self._clients остаётся каноническим
+        # "kucoin" — busy_exchanges/safe_exchanges работают по нему (см.
+        # комментарий про ONE kucoin/mexc в _handle_opportunity).
+        ccxt_class_id = "kucoinfutures" if exchange_id == "kucoin" else exchange_id
+        if not hasattr(ccxt_async, ccxt_class_id):
             print(f"[scanner] Биржа '{exchange_id}' из SCANNER_EXCHANGES не поддерживается CCXT — пропускаю.")
             return None
-        exchange_class = getattr(ccxt_async, exchange_id)
+        exchange_class = getattr(ccxt_async, ccxt_class_id)
         # timeout — жёсткий предел на любой сетевой запрос: без него один
         # зависший (не оборвавшийся, просто "молчащий") вызов может
         # заблокировать цикл сканера намного дольше, чем спасает
@@ -3013,7 +3030,7 @@ class FundingScanner:
                 cached = self._rest_book_cache.get(key)
                 if cached and now_mono - cached[0] < min_interval:
                     return cached[1]
-                book = await client.fetch_order_book(symbol, limit=50)
+                book = await client.fetch_order_book(symbol, limit=_rest_book_limit(client))
                 self._rest_book_cache[key] = (time.monotonic(), book)
                 return book
 
@@ -3292,8 +3309,8 @@ class FundingScanner:
             return False
         try:
             long_book, short_book = await asyncio.gather(
-                long_client.fetch_order_book(position.long_symbol, limit=50),
-                short_client.fetch_order_book(position.short_symbol, limit=50),
+                long_client.fetch_order_book(position.long_symbol, limit=_rest_book_limit(long_client)),
+                short_client.fetch_order_book(position.short_symbol, limit=_rest_book_limit(short_client)),
             )
         except Exception as exc:
             print(

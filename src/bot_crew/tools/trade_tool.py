@@ -1554,6 +1554,15 @@ class TradeExecutionTool(BaseTool):
                 # set_position_mode/set_leverage) может уйти не на тот
                 # аккаунт и снова словить "Insufficient margin".
                 order_params["uta"] = False
+            elif exchange_id == "kucoinfutures":
+                # KuCoin (проверено с сервера 2026-09-15): новый API ордеров
+                # без явного marginMode считает ордер ISOLATED, а символ на
+                # аккаунте в CROSS — биржа отвечает 330005 "order's margin
+                # mode does not match". Передаём cross ЯВНО (правило: никогда
+                # не переключаемся на isolated — меняем параметр ордера, а не
+                # режим аккаунта). leverage тоже в ордере: CCXT иначе шлёт 1.
+                order_params["marginMode"] = "cross"
+                order_params["leverage"] = leverage
 
             # ОДИН прямой ордер на запрошенную сумму — БЕЗ лестницы
             # уменьшения и БЕЗ каскада подъёма (убрано 2026-09-06 по явной
@@ -3016,6 +3025,10 @@ class TradeExecutionTool(BaseTool):
                 # См. _ensure_bitget_one_way_mode/_place_single_order — тот
                 # же форс classic-эндпоинта вместо UTA при закрытии.
                 close_params["uta"] = False
+            elif exchange_id == "kucoinfutures":
+                # См. _place_single_order — без явного cross ордер закрытия
+                # уйдёт как isolated и упадёт с 330005, позиция останется.
+                close_params["marginMode"] = "cross"
 
             # См. тот же комментарий в _place_single_order — Hyperliquid
             # требует ЯВНЫЙ price в самом create_order() даже для
